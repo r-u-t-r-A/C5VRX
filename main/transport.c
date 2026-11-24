@@ -72,10 +72,12 @@ static const uint16_t *demod_table(uint8_t d)
 }
 static const void *tracker_program(void) { return demod_program(s_demod); }
 
-/* Six-bit DAC only. Baseline wiring stays D4..D9. Clock Pin D10
- * relocates bit 2 (2k resistor) from D6/GPIO11 to D3/GPIO7 at boot.
- * D10/GPIO10 then carries PARLIO TX's clock, never an extra DAC bit. */
-static const int s_dac_gpio[8] = {23, 24, 11, 12, 8, 9, -1, -1};
+/* Six-bit DAC only. c5div-rx: bit 2 is fixed on D3/GPIO7, the C5VRX-5
+ * "Clock Pin D10" wiring, because D6/GPIO11 showed a ~25 ns rising-edge
+ * delay that corrupts bit 2 when the bus is sampled digitally (LAP87's
+ * capture tests, C5VRX issue #256). The D10 clock itself is not exported.
+ * Bit order LSB..MSB: XIAO D4, D5, D3, D7, D8, D9. */
+static const int s_dac_gpio[8] = {23, 24, 7, 12, 8, 9, -1, -1};
 
 DMA_ATTR __attribute__((aligned(64))) uint8_t s_raw_ring[RAW_RING_BYTES];
 static parlio_rx_unit_handle_t s_rx;
@@ -181,25 +183,14 @@ static esp_err_t prepare_tx(void)
         .bit_pack_order = PARLIO_BIT_PACK_ORDER_LSB,
     };
     for (unsigned k = 0; k < 8u; ++k) cfg.data_gpio_nums[k] = s_dac_gpio[k];
-#ifdef HWX_NO_DAC
-    /* Hardware experiment without the resistor DAC: TX runs on no pads. */
-    for (unsigned k = 0; k < 8u; ++k) cfg.data_gpio_nums[k] = -1;
-#endif
-    if (experimental_clock_d10()) {
-        cfg.clk_out_gpio_num = 10;
-        cfg.data_gpio_nums[2] = 7;
-    }
-    /* The driver owns these pads through menu and halted restarts. Data
-     * shifts on falling edges; capture on rising edges (verify on hardware).
-     * Clock can stop with TX: external capture must tolerate interruptions. */
+    /* The driver owns these pads through TX holds and halted restarts. */
     esp_err_t err = parlio_new_tx_unit(&cfg, &s_tx);
     if (err != ESP_OK) return err;
     const bitscrambler_config_t bs = {.dir = BITSCRAMBLER_DIR_TX, .attach_to = SOC_BITSCRAMBLER_ATTACH_PARL_IO};
     err = bitscrambler_new(&bs, &s_bs);
     if (err != ESP_OK) return err;
-    printf("SAMPLE_CLOCK enabled=%u gpio=%d hz=%u dac_bit2_gpio=%d\n",
-           experimental_clock_d10(), cfg.clk_out_gpio_num,
-           experimental_clock_d10() ? 40000000u : 0u, cfg.data_gpio_nums[2]);
+    printf("DAC_PINS gpio=%d,%d,%d,%d,%d,%d (XIAO D4,D5,D3,D7,D8,D9; LSB..MSB)\n", s_dac_gpio[0], s_dac_gpio[1],
+           s_dac_gpio[2], s_dac_gpio[3], s_dac_gpio[4], s_dac_gpio[5]);
     return enable_tx();
 }
 
@@ -308,7 +299,7 @@ static bool program_words(const uint8_t *bin, const uint8_t **inst)
  * decoder image through the shared guard and verified rollback coordinator. */
 bool transport_restart_profile(void)
 {
-    if (s_transport_fault || !s_lut_known || !s_started || s_menu_active ||
+    if (s_transport_fault || !s_lut_known || !s_started || tx_hold_active() ||
         !transport_guard_ready(&s_switch_guard, esp_timer_get_time())) return false;
     stage_hooks();
     const bool ok = resume_live(demod_table(s_demod));
@@ -351,7 +342,7 @@ bool transport_set_demod(uint8_t d)
 {
     if (s_transport_fault || d >= TRANSPORT_DEMODS) return false;
     if (d == s_demod) return true;
-    if (s_menu_active || !s_started) { s_demod = d; return true; }
+    if (tx_hold_active() || !s_started) { s_demod = d; return true; }
     if (!transport_guard_ready(&s_switch_guard, esp_timer_get_time())) return false;
     s_demod = d;
     const bool ok = resume_live(demod_table(d));
@@ -384,7 +375,7 @@ bool transport_set_output_affine(unsigned word)
 {
     if (s_transport_fault || (word && !output_is_affine(word)) || (word && s_output != 0u)) return false;
     if (word == s_affine) return true;
-    if (s_menu_active || !s_started) { s_affine = word; return true; }
+    if (tx_hold_active() || !s_started) { s_affine = word; return true; }
     if (!transport_guard_ready(&s_switch_guard, esp_timer_get_time())) return false;
     s_affine = word;
     bool ok = resume_live(s_lut_known ? demod_table(s_demod) : NULL);
@@ -396,7 +387,7 @@ bool transport_set_output(unsigned level)
     if (s_transport_fault || level >= OUTPUT_LEVELS) return false;
     if (level == s_output) return true;
     /* A manual change starts from the manual level: AUTO measures again. */
-    if (s_menu_active || !s_started) { s_output = level; s_affine = 0u; return true; }
+    if (tx_hold_active() || !s_started) { s_output = level; s_affine = 0u; return true; }
     if (!transport_guard_ready(&s_switch_guard, esp_timer_get_time())) return false;
     s_output = level;
     s_affine = 0u;
@@ -748,10 +739,6 @@ void transport_flog_output(transport_flog_output_t *out)
 
 void transport_print(void)
 {
-    printf("SAMPLE_CLOCK enabled=%u requested=%u gpio=%d hz=%u dac_bit2_gpio=%d reboot=%u\n",
-           experimental_clock_d10(), experimental_get(EXP_CLOCK_D10),
-           experimental_clock_d10() ? 10 : -1, experimental_clock_d10() ? 40000000u : 0u,
-           experimental_clock_d10() ? 7 : 11, experimental_reboot_needed());
     const char *verified_demod = s_have_verified && s_lut_known && !s_transport_fault ?
         transport_demod_name(s_verified_demod) : "unknown";
     printf("DEMOD selected=%s verified=%s p64_model=%s p64_table_sha256=%s u85q_table_sha256=%s u50p64_table_sha256=%s "
@@ -764,8 +751,7 @@ void transport_print(void)
            (unsigned long)s_stage_us[TR_BS_RESET], (unsigned long)s_stage_us[TR_BS_START],
            (unsigned long)s_stage_us[TR_RX_ENABLE], (unsigned long)s_stage_us[TR_TX_ENABLE],
            (unsigned long)s_stage_us[TR_RX_START], (unsigned long)s_stage_us[TR_TX_START]);
-    printf("VIDEO_OUTPUT source=%s standard=%s\n", s_menu_active ? "MENU" : s_started ? "LIVE" : "OFF",
-           s_video_std == VIDEO_STD_PAL ? "PAL" : "NTSC");
+    printf("VIDEO_OUTPUT source=%s\n", tx_hold_active() ? "HOLD" : s_started ? "LIVE" : "OFF");
     printf("OUTPUT level=%s boot_restore=saved default=1.0x clipped_lut_entries=%u recovery_errors=%lu rollbacks=%lu "
            "rollback_fail=%lu fault_latched=%u live=%u\n", transport_output_name(), s_output_clipped,
            (unsigned long)s_restart_errors, (unsigned long)s_rollbacks, (unsigned long)s_rollback_fail,

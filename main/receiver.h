@@ -15,9 +15,9 @@
 #include "freertos/task.h"
 #include "hal/dma_types.h"
 #include "gain.h"
-#include "menu_raster.h"
-#include "menu_ui.h"   /* MENU_* items */
 #include "rf.h"
+
+typedef enum { VIDEO_STD_NTSC, VIDEO_STD_PAL } video_standard_t;   /* was menu_raster.h */
 
 #define IQ_RATE_HZ          40000000u
 #define RAW_RING_BYTES      32768u
@@ -78,7 +78,13 @@ const char *transport_program_name(void);
  * U50P64-R1 at the edge for deviation ~0.7 (host model), its luma 3-4 dB
  * noisier at 2-9 dB C/N. */
 enum { TRANSPORT_DEMOD_P64, TRANSPORT_DEMOD_U85Q, TRANSPORT_DEMOD_U50P64, TRANSPORT_DEMOD_D32, TRANSPORT_DEMODS };
+/* c5div-rx: the boot decoder is a build option (main/CMakeLists.txt,
+ * -DC5DIV_DEMOD=D32|P64|U50P64|U85Q); C5VRX-5's default is D32-R2. */
+#ifdef C5DIV_DEMOD
+#define TRANSPORT_DEMOD_DEFAULT C5DIV_DEMOD
+#else
 #define TRANSPORT_DEMOD_DEFAULT TRANSPORT_DEMOD_D32
+#endif
 #define TRANSPORT_DEMOD_KEY "demod3"
 const char *transport_demod_short(uint8_t d);   /* menu: "P64", "U85Q", "U50", "D32" */
 uint8_t transport_demod(void);
@@ -180,22 +186,17 @@ uint8_t receiver_gain_mode_next(uint8_t mode);
 const char *receiver_gain_mode_name(uint8_t mode, char *buf, unsigned size);
 
 /* ---- control.c ---- */
-extern volatile bool s_menu_active;
 extern volatile int s_signal_strength;
-extern volatile bool s_scan_active;
-extern volatile unsigned s_scan_progress;
+extern volatile bool s_scan_active;   /* calibration_filter's quiet-channel search: the control loop stands aside */
 extern volatile int s_cfo_khz;
 extern volatile bool s_afc_locked;
 extern volatile bool s_afc_enabled;
 extern volatile std_mode_t s_std_mode;
-extern volatile video_standard_t s_video_std;      /* standard the menu emits */
 extern volatile bool s_detected_std_valid;
 extern volatile video_standard_t s_detected_std;
 extern volatile int64_t s_last_video_us;           /* last burst-confirmed sync */
-extern QueueHandle_t s_commands;
 void control_start(void);
-bool control_prepare(void); /* reserve control stack/TCB and command queue before driver allocations */
-video_standard_t menu_standard(void);
+bool control_prepare(void); /* reserve control stack/TCB before driver allocations */
 void control_print(void);
 void control_print_beat(void);   /* STATUS line every 2 s (console.c) */
 
@@ -275,30 +276,16 @@ bool calibration_dc_ok(uint8_t gain);
  * post-gain hook is silent while paused). true when a pair is held. */
 bool calibration_dc_hold_current(void);
 /* Explicit bench-only lane comparison (console L): video stops ~2 s. */
-void lane_compare_request(void);
-void self_noise_request(void);   /* bench: noise floor with the video output on vs off (console N) */
 
-/* ---- menu.c ---- */
-extern volatile int s_menu_cursor;
-extern volatile int s_exp_sub; /* -1 closed, else EXP_* */
-extern bool s_exp_failed;
-extern volatile int s_cal_sub;   /* CALIBRATE submenu cursor, -1 = closed */
-bool menu_open(void);
-void menu_close(void);
-void menu_render(void);
-/* Boot logo while the receiver tasks start (main.c); Direct Gain runs
- * under it, the menu buttons and the startup phase wait for its end. */
-bool menu_splash_begin(void);
-void menu_splash_progress(int percent);
-void menu_splash_end(void);
-bool menu_splash_active(void);
-void menu_set_standard_mode(std_mode_t mode);
-/* DAC TEST item (dac_check.h): advance pattern -> one flat level per bit ->
- * all -> none -> pattern. Bench only: a flat level carries no sync. */
-void menu_dac_step(void);
-void status_screen(const char *title, const char *line1, const char *line2, int percent);
-void status_screen_end(void);
-bool menu_status_active(void);
+/* ---- txhold.c (c5div-rx): TX ownership that the C5VRX menu raster had ----
+ * While held, live video is off (flat DAC level) and RX keeps capturing. */
+bool tx_hold_active(void);          /* boot window or status hold (was s_menu_active) */
+bool boot_window_active(void);      /* gains settle, boot phase probe (was the splash) */
+bool status_hold_active(void);      /* calibration/filter work owns TX (was a status screen) */
+void boot_window_begin(void);
+void boot_window_end(void);
+void status_hold(const char *title, const char *line1, const char *line2, int percent);
+void status_hold_end(void);
 
 /* ---- profile.c ---- */
 #include "afc.h"
@@ -332,12 +319,6 @@ void profile_select_restore(int select);
 bool profile_live_mode(void);              /* live profile switch on (NVS prof_live) */
 void profile_set_live_mode(bool on);
 
-/* ---- diag.c: passive field diagnostics (diag_logic.h) ---- */
-void diag_window(bool measured, bool video_valid, bool afc_step);   /* control task, every window */
-void diag_picture(unsigned found, unsigned expected);                /* control task, every decoded window */
-void diag_poll(void);                   /* console task: prints queued records */
-void diag_report(void);                 /* console D */
-void diag_toggle_stream(void);          /* console R */
 
 
 /* ---- settings.c ---- */

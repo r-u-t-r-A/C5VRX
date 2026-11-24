@@ -82,7 +82,7 @@ static void cal_status(void)
     if (s_cal_own_channel) snprintf(line1, sizeof(line1), "KEEP THE VTX OFF");
     else snprintf(line1, sizeof(line1), "ON QUIET CHANNEL %s (VTX MAY STAY ON)", rf_channel()->name);
     snprintf(line2, sizeof(line2), "ABOUT %u S LEFT, THEN LIVE VIDEO", left);
-    status_screen("CALIBRATING", line1, line2, (int)(s_cal_done * 100u / s_cal_total));
+    status_hold("CALIBRATING", line1, line2, (int)(s_cal_done * 100u / s_cal_total));
 }
 
 /* *quiet stays false for a setting the PHY did not read back, so it can
@@ -171,7 +171,7 @@ bool filter_calibrate(bool automatic)
     bool ok = rf_set_filter(calibrated);
     receiver_set_gain(receiver_gain_top());   /* useful top: under an external LNA G83 folds */
     vTaskDelay(pdMS_TO_TICKS(50));
-    status_screen("CALIBRATING", "LOOKING FOR A QUIET CHANNEL", "ONE TIME ONLY, ABOUT 30 S", -1);
+    status_hold("CALIBRATING", "LOOKING FOR A QUIET CHANNEL", "ONE TIME ONLY, ABOUT 30 S", -1);
     const char *fail = ok ? NULL : "calibrated_bytes_not_applied";
     if (ok && !(ok = find_quiet_channel(original))) fail = "no_quiet_channel";
     s_cal_own_channel = rf_channel_index() == original;
@@ -307,8 +307,8 @@ bool filter_calibrate(bool automatic)
     printf("CAL_STEP step=filter ms=%lld settings=%u result=%s\n",
            (esp_timer_get_time() - s_cal_t0) / 1000, s_cal_done, ok ? "ok" : "failed");
     s_cal_total = 0;
-    status_screen(ok ? "FILTER CALIBRATED" : "FILTER NOT CALIBRATED", ok ? "NARROW FILTER STORED" : s_filter_result,
-                  ok ? "" : "USE MENU > CALIBRATE", ok ? 100 : -1);
+    status_hold(ok ? "FILTER CALIBRATED" : "FILTER NOT CALIBRATED", ok ? "NARROW FILTER STORED" : s_filter_result,
+                  ok ? "" : "HOLD THE BUTTON 8 S TO CALIBRATE", ok ? 100 : -1);
     vTaskDelay(pdMS_TO_TICKS(1500));
     receiver_set_gain(saved_gain);
     s_scan_active = false;

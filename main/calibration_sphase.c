@@ -58,7 +58,7 @@ static bool phase_slip(void)
     /* Close the splash-check/write race with main's TX handover. This
      * encloses only the existing one-microsecond register pulse, no waits. */
     vTaskSuspendAll();
-    const bool allowed = menu_splash_active() && esp_timer_get_time() < s_probe_deadline;
+    const bool allowed = boot_window_active() && esp_timer_get_time() < s_probe_deadline;
     if (allowed) rx_clock_slip(1);
     (void)xTaskResumeAll();
     return allowed;
@@ -68,7 +68,7 @@ sphase_verdict_t sphase_scan_n(const char *tag, unsigned positions, unsigned win
                                       bool carrier)
 {
     if (!receiver_pause(tag)) return SPHASE_UNSETTLED;
-    if (s_probe_deadline && (!menu_splash_active() || esp_timer_get_time() >= s_probe_deadline)) {
+    if (s_probe_deadline && (!boot_window_active() || esp_timer_get_time() >= s_probe_deadline)) {
         receiver_resume(); return SPHASE_UNSETTLED;
     }
     if (!s_probe_deadline) dco_hold_for_scan();
@@ -76,7 +76,7 @@ sphase_verdict_t sphase_scan_n(const char *tag, unsigned positions, unsigned win
     const bool fast = !carrier && positions == 3u;
     sphase_scan_reset(&s_sphase_last);
     for (unsigned pos = 0; pos < positions; ++pos) {
-        if (s_probe_deadline && (esp_timer_get_time() >= s_probe_deadline || !menu_splash_active())) break;
+        if (s_probe_deadline && (esp_timer_get_time() >= s_probe_deadline || !boot_window_active())) break;
         if (pos) { if (!phase_slip()) break; vTaskDelay(pdMS_TO_TICKS(20)); }
         if (collect(windows, &w) && (!fast || w.windows == windows))
             sphase_scan_add(&s_sphase_last, sphase_metric(&w));
@@ -94,7 +94,7 @@ sphase_verdict_t sphase_scan_n(const char *tag, unsigned positions, unsigned win
     } else {
         /* Positions repeat every three ticks: stop on one near the cleanest. */
         for (unsigned n = 0; s_sphase_last.valid && n < tries; ++n) {
-            if (s_probe_deadline && (esp_timer_get_time() >= s_probe_deadline || !menu_splash_active())) break;
+            if (s_probe_deadline && (esp_timer_get_time() >= s_probe_deadline || !boot_window_active())) break;
             if (!collect(windows, &w) || (fast && w.windows != windows)) break;
             int e = sphase_metric(&w);
             const int margin = carrier ? sphase_carrier_margin(s_sphase_last.best) : sphase_margin(s_sphase_last.best);

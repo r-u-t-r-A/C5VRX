@@ -1,0 +1,40 @@
+name: c5div-rx build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host tests (receiver core logic)
+        run: tools/host-tests.sh
+  firmware:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.0.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (pinned ESP-IDF v6.0.2 PHY)
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          . "$IDF_PATH/export.sh"
+          idf.py -DC5VRX5_COMMIT="${{ github.sha }}" build 2>&1 | tee build.log
+          ! grep -q "Unverified C5 PHY" build.log
+          esptool.py --chip esp32c5 merge_bin -o build/c5div_rx_merged.bin \
+            --flash_mode dio --flash_size 8MB --flash_freq 80m \
+            0x2000 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin \
+            0x10000 build/c5div_rx.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c5div-rx-firmware
+          path: |
+            build/c5div_rx.bin
+            build/c5div_rx_merged.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flasher_args.json
+            build/flash_args

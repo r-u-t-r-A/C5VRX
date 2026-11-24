@@ -2,8 +2,8 @@ idf_component_register(
     SRCS
         "main.c" "rf.c" "phy.c" "arc_phy.c" "transport.c" "gain.c" "agc.c" "receiver.c"
         "control.c" "calibration.c" "calibration_sphase.c" "calibration_filter.c" "calibration_dc.c"
-        "calibration_bench.c" "menu.c" "menu_ui.c" "menu_raster.c" "analog_video_detect.c"
-        "experimental.c" "experimental_phy.c" "settings.c" "console.c" "profile.c" "diag.c" "flightlog.c" "sense_lab.c"
+        "txhold.c"
+        "experimental.c" "settings.c" "status.c" "profile.c"
     INCLUDE_DIRS "."
     REQUIRES esp_wifi esp_phy nvs_flash esp_event esp_netif esp_driver_parlio
              esp_driver_gpio esp_driver_bitscrambler esp_driver_usb_serial_jtag
@@ -47,13 +47,13 @@ if(EXISTS "${C5_PHY_ARCHIVE}")
     endif()
 endif()
 
-# Hardware experiment build (hardware_experiments/<id>/hwx.h): idf.py -DC5VRX_HWX=<id>.
-# Production builds leave it unset and never see the experiment's pin map.
-if(C5VRX_HWX)
-    set(C5VRX_HWX_DIR "${CMAKE_CURRENT_LIST_DIR}/../hardware_experiments/${C5VRX_HWX}")
-    if(NOT C5VRX_HWX MATCHES "^[a-z0-9_]+$" OR NOT EXISTS "${C5VRX_HWX_DIR}/hwx.h")
-        message(FATAL_ERROR "Unknown hardware experiment '${C5VRX_HWX}' (hardware_experiments/<id>/hwx.h)")
+# c5div-rx: boot decoder, e.g. idf.py -DC5DIV_DEMOD=P64 build (default D32 = D32-R2).
+if(C5DIV_DEMOD)
+    set(_demods P64 U85Q U50P64 D32)
+    list(FIND _demods "${C5DIV_DEMOD}" _demod_index)
+    if(_demod_index LESS 0)
+        message(FATAL_ERROR "C5DIV_DEMOD must be one of ${_demods}")
     endif()
-    target_include_directories(${COMPONENT_LIB} PRIVATE "${C5VRX_HWX_DIR}")
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE C5VRX_HWX=1 C5VRX_HWX_ID="${C5VRX_HWX}")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE C5DIV_DEMOD=${_demod_index})
+    message(STATUS "c5div-rx boot decoder: ${C5DIV_DEMOD}")
 endif()

@@ -18,9 +18,6 @@
 #include "nvs_flash.h"
 #include "experimental.h"
 #include "soc/gpio_sig_map.h"
-#ifdef HWX_MENU_ON_IQ
-#include "hal/parlio_periph.h"
-#endif
 #include "soc/lp_aon_reg.h"
 
 #define REG32(a)         (*(volatile uint32_t *)(uintptr_t)(a))
@@ -130,17 +127,6 @@ void rf_reroute_lane(unsigned lane)
 
 unsigned rf_lane(void) { return s_lane; }
 
-#ifdef HWX_MENU_ON_IQ
-/* GPIO matrix output selects only; the pads stay configured by
- * route_modem_iq. PARLIO TX data bit k -> IQ pad k. */
-void rf_hwx_pads_tx(bool tx)
-{
-    for (unsigned k = 0; k < 8; ++k)
-        esp_rom_gpio_connect_out_signal(s_iq_pins[k], tx ? soc_parlio_signals[0].tx_units[0].data_sigs[k]
-                                                         : MODEM_DIAG0_IDX + s_lane_diag[s_lane][k], false, false);
-    __asm__ __volatile__("fence iorw, iorw" ::: "memory");
-}
-#endif
 const char *rf_lane_name(unsigned lane) { return lane < RF_LANES ? s_lane_names[lane] : "?"; }
 
 static void enable_continuous_modem(void)
@@ -500,8 +486,8 @@ static const fpv_channel_t s_channels[FPV_BANDS][8] = {
 static const char *const s_band_names[FPV_BANDS] = {
     "RACEBAND R", "BOSCAM A", "BOSCAM B", "BOSCAM E", "FATSHARK F", "LOWBAND L",
 };
-static size_t s_index = FPV_BAND_A * 8u;   /* A1, 5865 MHz */
-static uint16_t s_freq = 5865u;
+static size_t s_index = FPV_BAND_R * 8u;   /* c5div-rx: R1, 5658 MHz (C5VRX-5: A1) */
+static uint16_t s_freq = 5658u;
 static int s_offset_khz;
 
 const fpv_channel_t *rf_channel(void) { return &s_channels[s_index / 8u][s_index % 8u]; }

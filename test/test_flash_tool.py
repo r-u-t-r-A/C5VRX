@@ -127,20 +127,46 @@ class FlashToolTest(unittest.TestCase):
 
 
 class FakePort:
-    """Serial port double: records line states at open, replays reads, can fail."""
-    opened = []
+    """Serial port double: records the line states (dtr, rts) the chip sees, replays
+    reads, can fail. Like pyserial on Linux: both lines default to high, the kernel
+    raises them on open, then pyserial applies DTR before RTS."""
+    opened = []     # states visited, one list per open
 
     def __init__(self, reads=(), fail_open=0):
         self.reads, self.fail_open, self.writes = list(reads), fail_open, []
+        self()
 
     def __call__(self):
+        self.is_open, self._dtr, self._rts = False, True, True
         return self
+
+    @staticmethod
+    def quiet():
+        return all((False, True) not in o and o[-1] == (False, False) for o in FakePort.opened)
+
+    def _lines(self):
+        if self.is_open:
+            FakePort.opened[-1].append((self._dtr, self._rts))
+
+    dtr = property(lambda self: self._dtr)
+    rts = property(lambda self: self._rts)
+
+    @dtr.setter
+    def dtr(self, v):
+        self._dtr = v
+        self._lines()
+
+    @rts.setter
+    def rts(self, v):
+        self._rts = v
+        self._lines()
 
     def open(self):
         if self.fail_open:
             self.fail_open -= 1
             raise flash_serial.SerialException("gone")
-        FakePort.opened.append((self.dtr, self.rts))
+        FakePort.opened.append([(True, True), (self._dtr, True), (self._dtr, self._rts)])
+        self.is_open = True
 
     def read(self, n):
         item = self.reads.pop(0) if self.reads else b""
@@ -160,6 +186,12 @@ class MonitorTest(unittest.TestCase):
     def setUp(self):
         FakePort.opened = []
 
+    def assert_quiet_opens(self, count):
+        """Opened `count` times, ending with both lines low and never in the state
+        that resets the chip (DTR low, RTS high)."""
+        self.assertEqual(len(FakePort.opened), count)
+        self.assertTrue(FakePort.quiet(), FakePort.opened)
+
     def monitor(self, port, keys, console=None, iq_every=0.0):
         keys = list(keys)
         console = console or flash.Console(io.StringIO())
@@ -171,7 +203,7 @@ class MonitorTest(unittest.TestCase):
     def test_opens_with_lines_low_and_forwards_keys(self):
         port = FakePort([b"boot\n", b"", b"T: ch A1\n"])
         out = self.monitor(port, [None, "T", None])
-        self.assertEqual(FakePort.opened, [(False, False)])
+        self.assert_quiet_opens(1)
         self.assertIn("boot\nT: ch A1\n", out)
         self.assertEqual(port.writes, [b"T"])
 
@@ -185,7 +217,7 @@ class MonitorTest(unittest.TestCase):
         # Open fails while the restart re-enumerates USB, then the port drops mid-read.
         port = FakePort([b"a", flash_serial.SerialException("lost"), b"b"], fail_open=3)
         out = self.monitor(port, [None, None, None])
-        self.assertEqual(FakePort.opened, [(False, False), (False, False)])
+        self.assert_quiet_opens(2)
         self.assertIn("port lost, reopening", out)
         self.assertIn("b", out.split("reopening")[1])
 
@@ -221,22 +253,6 @@ def snapshot_lines(data=IQ, corrupt=False):
 
 
 class ConsoleTest(unittest.TestCase):
-    def test_log_is_timestamped_and_field_diag_compare_reads_it(self):
-        spec = importlib.util.spec_from_file_location("compare", Path(__file__).parents[1] / "tools/field_diag_compare.py")
-        compare = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(compare)
-        with tempfile.TemporaryDirectory() as d:
-            path = Path(d) / "bench.log"
-            with open(path, "w") as log:
-                c = flash.Console(io.StringIO(), log)
-                c.feed("FIELD_DIAG t=1 sync_valid_pct=100 gain=70 max=83\r\nFIELD_DIAG t=2 sync_")
-                c.feed("valid_pct=0 gain=70 max=83\n")
-                c.note("CHECK result=pass")
-            text = path.read_text()
-            self.assertRegex(text.splitlines()[0], r"^\d\d:\d\d:\d\d\.\d{3} FIELD_DIAG t=1 ")
-            self.assertIn(" # CHECK result=pass", text)
-            self.assertEqual(compare.summary(str(path))["seconds"], 2)
-
     def test_partial_line_shown_once(self):
         c = flash.Console(io.StringIO())
         c.feed("menu> ")
@@ -432,7 +448,7 @@ class CheckBoardTest(unittest.TestCase):
                 mock.patch.object(flash.time, "monotonic", lambda: next(clock)):
             lines = flash.check_board("COM6", console, True)
         self.assertEqual(port.writes, [b"T", b"D"])
-        self.assertTrue(all(o == (False, False) for o in FakePort.opened))
+        self.assertTrue(FakePort.opened and FakePort.quiet(), FakePort.opened)
         self.assertEqual(lines, GOOD)
 
 

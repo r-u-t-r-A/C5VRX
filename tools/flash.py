@@ -113,13 +113,19 @@ def wait_for_port(port, timeout_s=6.0, settle_s=1.0):
 
 
 def open_quiet(port):
-    """Open the console with DTR and RTS low before the open, so it never resets the chip."""
+    """Open the console without resetting the chip.
+
+    c5div-rx: on Linux the kernel raises DTR and RTS on open, and pyserial
+    then applies DTR before RTS; asking for both low passes through
+    DTR=0/RTS=1, which the USB-Serial-JTAG treats as a chip reset (and a
+    reset of a running image hangs it). Lower RTS first, then DTR:
+    (1,1) -> (1,0) -> (0,0) never visits the reset state."""
     import serial
     s = serial.Serial()
     s.port, s.baudrate, s.timeout, s.write_timeout = port, 115200, 0.05, 0.5
-    s.dtr = False
     s.rts = False
     s.open()
+    s.dtr = False
     return s
 
 

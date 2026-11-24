@@ -7,7 +7,6 @@
  * calibration_* functions in receiver.h. */
 #pragma once
 #include "receiver.h"
-#include "sense_lab.h"
 #include "cn_auto.h"
 #include "calibration_noise.h"
 #include "calibration_policy.h"
@@ -112,6 +111,3 @@ void cal_dc_dump_tables(cal_dump_t *d);
 void cal_dc_print(rf_filter_t f);
 
 /* ---- calibration_bench.c ---- */
-extern volatile bool s_lane_requested, s_selfnoise_requested;
-void lane_compare(void);
-void self_noise_test(void);

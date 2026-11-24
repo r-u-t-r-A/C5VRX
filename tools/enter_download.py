@@ -26,10 +26,13 @@ def enter_download(port, attempts=5, settle_s=1.5, log=print):
     for attempt in range(1, attempts + 1):
         s = serial.Serial()
         s.port, s.baudrate, s.timeout, s.write_timeout = port, 115200, 0.05, 0.5
-        s.dtr = False
+        # c5div-rx: RTS low before the open, DTR low after it. pyserial on
+        # Linux applies DTR first, so asking for both low before open passes
+        # through DTR=0/RTS=1 - a USB-Serial-JTAG chip reset.
         s.rts = False
         try:
             s.open()
+            s.dtr = False
         except serial.SerialException as e:
             log(f"enter_download: open {port} failed ({e}); retrying")
             time.sleep(0.5)

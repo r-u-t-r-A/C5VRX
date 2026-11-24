@@ -754,7 +754,7 @@ static const char *dco_quiet_rows(bool manual, bool refine, int64_t deadline, co
         char line2[48];
         unsigned left = done ? (unsigned)((esp_timer_get_time() - t0) / done * (rows - done) / 1000000) + 1u : rows * 2u;
         snprintf(line2, sizeof(line2), "ABOUT %u S LEFT, THEN LIVE VIDEO", left);
-        status_screen("CALIBRATING DC", line1, line2, rows ? (int)(done * 100u / rows) : 0);
+        status_hold("CALIBRATING DC", line1, line2, rows ? (int)(done * 100u / rows) : 0);
         if (esp_timer_get_time() > deadline) { why = "timeout"; break; }
         unsigned env = 0;
         int clip = 0;
@@ -886,9 +886,9 @@ void dco_startup(bool manual, int64_t deadline)
     /* The noise floor ends the search before the last row: that is the
      * normal end, not a stall, so the bar completes and says so. */
     if (complete)
-        status_screen("DC CALIBRATED", "LOWER GAINS NEED NO DC CORRECTION", "", 100);
+        status_hold("DC CALIBRATED", "LOWER GAINS NEED NO DC CORRECTION", "", 100);
     else
-        status_screen("DC NOT COMPLETE", why, "USE MENU > CALIBRATE", -1);
+        status_hold("DC NOT COMPLETE", why, "HOLD THE BUTTON 8 S TO CALIBRATE", -1);
     vTaskDelay(pdMS_TO_TICKS(800));
     if (stale && complete && !dco_template_rows()) {
         s_dco.filter_code = live.code;          /* every row now has a result in the live filter */
@@ -1357,7 +1357,7 @@ uint32_t health_context(void)
     uint32_t h = 2166136261u;
     const uint32_t part[] = {s_gain_epoch, s_control_epoch, phy_generation(), rf_table_generation(),
         rf_frequency_mhz(), (uint32_t)rf_offset_khz(), live_filter_key(), s_current_gain,
-        menu_splash_active(), s_menu_active};
+        boot_window_active(), tx_hold_active()};
     for (unsigned k = 0; k < sizeof(part) / sizeof(part[0]); ++k) h = (h ^ part[k]) * 16777619u;
     return h;
 }
@@ -1366,7 +1366,7 @@ void drift_service(void)
 {
     s_dc_urgent = false;
     if (s_startup || s_scan_active || receiver_paused() || phy_busy() ||
-        (s_menu_active && !menu_splash_active()) || rf_lane() != RF_LANE_ULTRAFINE) return;
+        (tx_hold_active() && !boot_window_active()) || rf_lane() != RF_LANE_ULTRAFINE) return;
     const int64_t now = esp_timer_get_time();
     static int64_t next_us;
     if (now < next_us || now - s_last_gain_write_us < 20000) return;
@@ -1402,7 +1402,7 @@ void drift_service(void)
         const bool already = s_cal_notice && s_cal_notice_freq == rf_frequency_mhz() && s_cal_notice_key == live_filter_key();
         s_cal_notice = true;
         s_cal_notice_freq = rf_frequency_mhz(); s_cal_notice_key = live_filter_key(); s_cal_notice_gain = s_current_gain;
-        if (!already) printf("CAL_NEEDED reason=%s dc_mcells=%d/%d action=MENU_CALIBRATE auto_cal=0\n",
+        if (!already) printf("CAL_NEEDED reason=%s dc_mcells=%d/%d action=HOLD_BUTTON_8S auto_cal=0\n",
                              mismatch > 0 ? "filter_readback" : !calibration_sphase_settled() ? "sampling_phase" :
                              persistent ? "dc_servo_failed" : "dc_servo_limit",
                              w.dc_i, w.dc_q);
@@ -1421,7 +1421,7 @@ void drift_service(void)
      * G83 without a carrier, 2.4-4.2 cells of DC for 12 s, 0 servo writes,
      * until a gain change). Demotion is a scan's verdict (phase_service,
      * sphase_qualify, the carrier scans). */
-    if (copied && w.windows == 24u && !menu_splash_active()) {
+    if (copied && w.windows == 24u && !boot_window_active()) {
         (void)sphase_record(&w);
         if (s_sphase_excess < (carrier ? SPHASE_LIVE_LIMIT : SPHASE_LIMIT)) s_sphase_state = "settled";
     }

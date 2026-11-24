@@ -31,7 +31,8 @@ static int64_t s_health_us,s_last_gain_write_us;
 static int s_drift_avg[2],s_sphase_excess;
 static const char *s_sphase_state="unverified";
 static bool calibration_sphase_settled(void){return !strcmp(s_sphase_state,"settled")||!strcmp(s_sphase_state,"noise_limited");}
-static bool s_dc_urgent,s_startup,s_scan_active,s_menu_active;
+static bool s_dc_urgent,s_startup,s_scan_active,s_hold;
+static bool tx_hold_active(void){return s_hold;}
 static bool paused,busy,splash,copy_ok=true,qualified=true,dither=true,video,circle,change_context;
 static int measured_i,measured_q,mismatch,phase=20;
 static unsigned env=100;
@@ -41,7 +42,7 @@ static unsigned context=1,collections,warnings;
 static int64_t esp_timer_get_time(void){return now;}
 static bool receiver_paused(void){return paused;}
 static bool phy_busy(void){return busy;}
-static bool menu_splash_active(void){return splash;}
+static bool boot_window_active(void){return splash;}
 static unsigned rf_lane(void){return 2;}
 static uint32_t health_context(void){return context;}
 static int phy_filter_hw_mismatch(void *a,void *b){(void)a;(void)b;return mismatch;}
@@ -93,9 +94,9 @@ int main(void){
  /* Hardware readback is independently qualified even without a valid DC cloud. */
  ++context;copy_ok=false;mismatch=2;tick();tick();tick();assert(warnings==2);
  mismatch=0;copy_ok=qualified=true;measured_i=0;tick();tick();tick();
- unsigned prev=collections;s_menu_active=true;tick();assert(collections==prev);
+ unsigned prev=collections;s_hold=true;tick();assert(collections==prev);
  splash=true;tick();assert(collections==prev+1); /* can use existing boot raster */
- s_menu_active=splash=false;paused=true;prev=collections;tick();assert(collections==prev);
+ s_hold=splash=false;paused=true;prev=collections;tick();assert(collections==prev);
  paused=false;s_startup=true;tick();assert(collections==prev);
  /* Real low-gain noise can be below the circle-fit variance threshold but
   * still dither >=3 cells per axis; it must reveal a large DC park. */

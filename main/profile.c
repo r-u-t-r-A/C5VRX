@@ -86,7 +86,7 @@ bool profile_set(int p)
         if (p != PROFILE_DEFAULT) return false;
         f = rf_filter();            /* uncalibrated: keep what is set */
     }
-    if (transport_live() && !s_menu_active) return false;
+    if (transport_live() && !tx_hold_active()) return false;
     if ((!rf_filter_equal(rf_filter(), f) || !rf_filter_applied()) && !rf_set_filter(f)) {
         printf("PROFILE error: filter code=%d skirt=%u not applied (read back code=%d skirt=%d)\n", f.code, f.skirt,
                phy_filter_code(), phy_filter_skirt());
@@ -160,11 +160,11 @@ void profile_channel_changed(void)
     const int p = s_select != PROFILE_SELECT_AUTO && profile_selectable(s_select) ? s_select : PROFILE_DEFAULT;
     if (p != PROFILE_DEFAULT) s_reason = "menu_select";
     if (s_profile == p) { profile_live_begin(); return; }
-    if (s_menu_active) { (void)profile_set(p); }
+    if (tx_hold_active()) { (void)profile_set(p); }
     else {
-        status_screen("CHANNEL", rf_channel()->name, profile_name(p), -1);
+        status_hold("CHANNEL", rf_channel()->name, profile_name(p), -1);
         (void)profile_set(p);
-        status_screen_end();
+        status_hold_end();
     }
     profile_live_begin();
 }
@@ -202,7 +202,7 @@ static void live_apply(void)
 {
     const int p = s_switch_pending;
     if (p < 0 || p == s_profile) { s_switch_pending = -1; return; }
-    if (s_menu_active || calibration_in_startup() || transport_faulted()) return;
+    if (tx_hold_active() || calibration_in_startup() || transport_faulted()) return;
     if (transport_switch_wait_ms()) return;                  /* retry after the cooldown */
     /* An automatic narrowing waits for the lock (lost while waiting?); the
      * operator's FILTER choice needs only the class's filter and DC table. */
@@ -385,7 +385,7 @@ int profile_select_cycle(void)
     const int p = next == PROFILE_SELECT_AUTO ? PROFILE_DEFAULT : next;
     s_select = next;
     s_reason = next == PROFILE_SELECT_AUTO ? "menu_auto" : "menu_select";
-    if (s_menu_active) {
+    if (tx_hold_active()) {
         if (!profile_set(p)) printf("PROFILE select %s refused: filter not applied\n", s_names[p]);
     } else {
         s_switch_pending = p;

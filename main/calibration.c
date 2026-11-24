@@ -27,14 +27,14 @@ bool calibration_in_startup(void) { return s_startup; }
 
 bool quiet_owner(void)
 {
-    return !s_menu_active && !s_scan_active && !receiver_paused() && !phy_busy();
+    return !tx_hold_active() && !s_scan_active && !receiver_paused() && !phy_busy();
 }
 
 /* Status screens of the startup phase own TX (menu raster), so the menu
  * check must not count them as a busy owner. */
 static bool startup_owner(void)
 {
-    return (!s_menu_active || menu_status_active()) && !s_scan_active && !receiver_paused() && !phy_busy();
+    return (!tx_hold_active() || status_hold_active()) && !s_scan_active && !receiver_paused() && !phy_busy();
 }
 
 bool collect_stats(unsigned windows, window_stats_t *out, bool noise)
@@ -45,7 +45,7 @@ bool collect_stats(unsigned windows, window_stats_t *out, bool noise)
     uint16_t hi[16] = {0}, hq[16] = {0};
     memset(out, 0, sizeof(*out));
     for (unsigned tries = 0; tries < windows * 3u && out->windows < windows; ++tries) {
-        if (s_probe_deadline && (esp_timer_get_time() >= s_probe_deadline || !menu_splash_active())) break;
+        if (s_probe_deadline && (esp_timer_get_time() >= s_probe_deadline || !boot_window_active())) break;
         vTaskDelay(2);   /* two ticks: one tick starved IDLE with the observer */
         if (!copy_probe_window(sample, NULL)) continue;
         for (unsigned r = 0; r < PROBE_REGIONS; ++r) {
@@ -175,7 +175,7 @@ static void startup_phase(bool full)
     vTaskDelay(pdMS_TO_TICKS(manual ? 200 : 1500));
     for (unsigned k = 0; k < 100u && !startup_owner(); ++k) vTaskDelay(pdMS_TO_TICKS(100));
     if (!startup_owner()) {
-        printf("STARTUP skip=owner_busy menu=%u scan=%u paused=%u\n", s_menu_active, s_scan_active, receiver_paused());
+        printf("STARTUP skip=owner_busy menu=%u scan=%u paused=%u\n", tx_hold_active(), s_scan_active, receiver_paused());
     } else {
         printf("STARTUP begin manual=%u filter=%s dco_rows=%u deviation_x100=%d\n", manual,
                cal_filter_measured() ? "stored" : "missing", dco_valid_rows(),
@@ -183,7 +183,7 @@ static void startup_phase(bool full)
         /* A manual run re-measures the filter and the VTX: leave a matched
          * profile first, so filter and tracker never disagree. */
         if (profile_active() != PROFILE_DEFAULT) {
-            status_screen("CALIBRATING", "BACK TO THE DEFAULT PROFILE", "", -1);
+            status_hold("CALIBRATING", "BACK TO THE DEFAULT PROFILE", "", -1);
             if (!profile_set(PROFILE_DEFAULT)) printf("STARTUP error: DEFAULT profile not applied\n");
         }
         printf("STARTUP step=sphase\n");
@@ -203,7 +203,7 @@ static void startup_phase(bool full)
         if (!full && esp_timer_get_time() < deadline) filter_measure_current();
         printf("STARTUP step=deviation\n");
         /* Video needs a moment back on the own channel before measuring. */
-        status_screen_end();
+        status_hold_end();
         vTaskDelay(pdMS_TO_TICKS(1500));
         /* Final qualification in the live TX/RX context, before the VTX
          * deviation measurement that needs the picture. */
@@ -223,7 +223,7 @@ static void startup_phase(bool full)
         snprintf(line, sizeof(line), "GAIN %s COSTS RANGE: USE AUTO", name);
         printf("GAIN_WARNING mode=%s: a fixed gain is saved and costs range; menu GAIN or console G to AUTO\n",
                name);
-        status_screen("GAIN NOT AUTO", line, "MENU > GAIN, HOLD TO CHANGE", -1);
+        status_hold("GAIN NOT AUTO", line, "MENU > GAIN, HOLD TO CHANGE", -1);
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
     /* A calibration never ends silently half done: blackbox 2026-10-27 had
@@ -246,10 +246,10 @@ static void startup_phase(bool full)
         }
         printf("CAL_RESULT dc=%s why=%s template_rows=%u missing_rows=%u filter=%s\n", dc_ok ? "complete" : "incomplete",
                s_dco_last_why, templ, missing, s_filter_result);
-        status_screen(dc_ok ? "CALIBRATION OK" : "CALIBRATION INCOMPLETE", line1, line2, dc_ok ? 100 : -1);
+        status_hold(dc_ok ? "CALIBRATION OK" : "CALIBRATION INCOMPLETE", line1, line2, dc_ok ? 100 : -1);
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
-    status_screen_end();
+    status_hold_end();
     s_startup = false;
     calib_record(manual, t0);
     flightlog_event(FLOG_E_CAL_END, NULL, 0);
@@ -387,7 +387,7 @@ static void boot_phase_check(void)
         collect(24, &w) && w.windows == 24u && sphase_record(&w) < SPHASE_LIMIT &&
         context == health_context())
         s_sphase_state = "settled";
-    else if (menu_splash_active() && esp_timer_get_time() < s_probe_deadline) {
+    else if (boot_window_active() && esp_timer_get_time() < s_probe_deadline) {
         const sphase_verdict_t v = sphase_scan_n("BOOT_PHASE", 3u, 24u, 3u, false);
         s_sphase_state = v == SPHASE_SETTLED ? "settled" : "unverified";
     }
@@ -435,8 +435,8 @@ static void calibration_task(void *arg)
         }
         periodic_us = esp_timer_get_time();
         if (s_boot_phase_pending && periodic_us >= s_boot_phase_until) s_boot_phase_pending = false;
-        if (s_boot_phase_pending && menu_splash_active()) boot_phase_check();
-        if (s_manual_requested && !s_menu_active) {
+        if (s_boot_phase_pending && boot_window_active()) boot_phase_check();
+        if (s_manual_requested && !tx_hold_active()) {
             const bool full = s_full_requested;
             s_manual_requested = s_full_requested = false;
             startup_phase(full);
@@ -445,9 +445,6 @@ static void calibration_task(void *arg)
             continue;
         }
         if (s_dump_requested) { s_dump_requested = false; calibration_dump(); continue; }
-        if (s_lane_requested && !s_menu_active) { s_lane_requested = false; lane_compare(); continue; }
-        if (s_selfnoise_requested && !s_menu_active) { s_selfnoise_requested = false; self_noise_test(); continue; }
-        if (sense_lab_pending() && !s_menu_active) { sense_lab_run(quiet_owner()); continue; }
         dco_service();
         servo_service();
         drift_service();

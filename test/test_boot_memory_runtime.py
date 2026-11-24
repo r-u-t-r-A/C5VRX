@@ -11,14 +11,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(source, raster=False):
+def run(source):
     with tempfile.TemporaryDirectory() as tmp:
         c = Path(tmp) / 'boot.c'
         c.write_text(source)
         command = [os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra',
                    '-Werror', '-I' + str(ROOT / 'main'), str(c)]
-        if raster:
-            command += [str(ROOT / 'main/menu_raster.c'), '-lm']
         subprocess.run(command + ['-o', str(Path(tmp) / 'boot')], check=True)
         subprocess.run([str(Path(tmp) / 'boot')], check=True)
 
@@ -102,71 +100,20 @@ int main(void) {
 }
 ''')
 
-    def test_progressive_fallback_releases_excess(self):
-        source = (ROOT / 'main/menu.c').read_text()
-        functions = source[source.index('static void free_nodes(void)'):source.index('static esp_err_t build_chain(')]
-        run(r'''
-#include <assert.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include "menu_raster.h"
-#define NODE_CHUNK 32u
-#define ESP_OK 0
-#define ESP_ERR_NO_MEM 1
-#define ESP_ERR_INVALID_SIZE 2
-#define MALLOC_CAP_DMA_DESC_AHB 1
-#define MALLOC_CAP_INTERNAL 2
-typedef int esp_err_t;
-typedef struct {uint32_t words[3];} dma_descriptor_t;
-static dma_descriptor_t *s_chunks[58];
-static unsigned s_chunk_count,s_node_capacity,s_node_count;
-static bool s_raster_flat;
-static menu_raster_t s_raster;
-static unsigned allocated,limit;
-static void *heap_caps_aligned_alloc(unsigned align,size_t size,unsigned caps) {
- assert(align==4 && size==384 && caps==3);
- if(allocated==limit)return NULL;
- ++allocated;return malloc(size);
-}
-static void heap_caps_free(void *p){assert(p && allocated);--allocated;free(p);}
-static bool count_segment(void *ctx,const uint8_t *data,unsigned bytes) {
- assert(data && bytes);++*(unsigned *)ctx;return true;
-}
-''' + functions + r'''
-int main(void) {
- unsigned required;
- for(unsigned pal=0;pal<2;++pal) {
-  /* Monochrome raster (shared tail+prefix nodes): interlaced NTSC 994 /
-   * PAL 1203 nodes (32 / 38 chunks), progressive 496 / 601 (16 / 19). */
-  limit=30; /* Interlaced fails after partial allocation, progressive fits. */
-  assert(reserve_chain(pal,true,&required)==ESP_ERR_NO_MEM && allocated==30);
-  assert(reserve_chain(pal,false,&required)==ESP_OK);
-  assert(required==(pal?601u:496u));
-  assert(allocated==(pal?19u:16u) && s_chunk_count==allocated);
-  assert(s_node_capacity==allocated*NODE_CHUNK);
-  for(unsigned i=s_chunk_count;i<58;++i)assert(!s_chunks[i]);
-  free_nodes();assert(!allocated && !s_node_capacity && !s_node_count);
-  limit=10; /* Neither chain fits: caller can release every partial chunk. */
-  assert(reserve_chain(pal,true,&required)==ESP_ERR_NO_MEM);
-  assert(reserve_chain(pal,false,&required)==ESP_ERR_NO_MEM);
-  free_nodes();assert(!allocated);
- }
-}
-''', raster=True)
-
     def test_boot_preserves_task_start_order(self):
         source = (ROOT / 'main/main.c').read_text()
         self.assertLess(source.index('receiver_prepare()'), source.index('rf_start()'))
-        self.assertLess(source.index('transport_start()'), source.index('menu_splash_begin()'))
-        self.assertLess(source.index('menu_splash_begin()'), source.index('receiver_start()'))
+        self.assertLess(source.index('transport_start()'), source.index('boot_window_begin()'))
+        self.assertLess(source.index('boot_window_begin()'), source.index('receiver_start()'))
         self.assertLess(source.index('receiver_start()'), source.index('control_start()'))
         failure = source[source.index('if (!receiver_start())'):source.index('    control_start();')]
-        for statement in ['menu_splash_end();', 'transport_stop_tx();', 'return;']:
+        for statement in ['boot_window_end();', 'transport_stop_tx();', 'return;']:
             self.assertIn(statement, failure)
         control = (ROOT / 'main/control.c').read_text()
-        self.assertIn('xQueueCreateStatic(16, sizeof(int)', control)
-        self.assertNotIn('xQueueCreate(16, sizeof(int)', control)
+        # c5div-rx: no command queue; the control task still starts from the
+        # early static reservation, never from the heap after the boot window.
+        self.assertIn('xTaskCreateStatic(control_task', control)
+        self.assertNotIn('xTaskCreate(control_task', control)
 
 
 if __name__ == '__main__':

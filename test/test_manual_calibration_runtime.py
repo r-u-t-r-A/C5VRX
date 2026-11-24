@@ -82,7 +82,7 @@ int main(void){
   self.assertEqual(lines[2],f'END 2 {hash_value:08x}')
  def test_dump_has_no_rf_actuator(self):
   s=''.join(p.read_text() for p in sorted((ROOT/'main').glob('calibration*.c')));body=s[s.index('static void calibration_dump(void)'):s.index('static void calibration_boot(void)')]
-  for name in ['rf_set_filter(', 'rf_set_channel(', 'receiver_set_gain(', 'phy_dco_search(', 'rx_clock_slip(', 'status_screen(', 'blob_store(']:
+  for name in ['rf_set_filter(', 'rf_set_channel(', 'receiver_set_gain(', 'phy_dco_search(', 'rx_clock_slip(', 'status_hold(', 'blob_store(']:
    self.assertNotIn(name,body)
  def test_menu_recommendation_is_latched_until_recovery(self):
   s=''.join(p.read_text() for p in sorted((ROOT/'main').glob('calibration*.c')))
@@ -123,7 +123,7 @@ static int64_t s_probe_deadline=600000,now;
 static bool splash=true,inside;
 static unsigned writes;
 static int64_t esp_timer_get_time(void){return now;}
-static bool menu_splash_active(void){return splash;}
+static bool boot_window_active(void){return splash;}
 static void vTaskSuspendAll(void){inside=true;}
 static int xTaskResumeAll(void){inside=false;return 0;}
 static void rx_clock_slip(unsigned n){assert(n==1);if(s_probe_deadline)assert(inside && splash && now<s_probe_deadline);++writes;}
@@ -135,28 +135,27 @@ int main(void){
  s_probe_deadline=0;assert(phase_slip() && writes==2); /* explicit manual path */
 }
 ''')
- def test_actual_splash_respects_application_deadline(self):
+ def test_actual_boot_window_respects_application_deadline(self):
   s=(ROOT/'main/main.c').read_text()
-  body=s[s.index('static void splash_wait_gain('):s.index('void app_main(void)')]
+  body=s[s.index('static void boot_wait_gain('):s.index('void app_main(void)')]
   run(r'''
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #define DG_HOLD 1
-#define SPLASH_MIN_MS 3000
-#define SPLASH_MAX_MS 4000
+#define BOOT_MIN_MS 3000
+#define BOOT_MAX_MS 4000
 #define pdMS_TO_TICKS(x) (x)
 static unsigned s_current_gain=83;
 static struct {int state;unsigned holds;} s_gain={1,1};
 static int64_t now;
 static int64_t esp_timer_get_time(void){return now;}
 static void vTaskDelay(unsigned ms){now+=ms*1000;}
-static void menu_splash_progress(int p){(void)p;}
 ''' + body + r'''
 int main(void){
- splash_wait_gain(0,0,1000000);assert(now==1000000); /* deadline overrides 3 s logo */
- now=0;splash_wait_gain(0,0,9000000);assert(now==3000000);
- now=0;s_gain.state=0;splash_wait_gain(0,0,9000000);assert(now==4000000);
+ boot_wait_gain(0,0,1000000);assert(now==1000000); /* deadline overrides the 3 s window */
+ now=0;boot_wait_gain(0,0,9000000);assert(now==3000000);
+ now=0;s_gain.state=0;boot_wait_gain(0,0,9000000);assert(now==4000000);
 }
 ''')
 
@@ -180,7 +179,7 @@ typedef struct {int clip_pm;} metrics_t;
 static int64_t s_probe_deadline;
 static int mode;
 static int64_t esp_timer_get_time(void){return 1;}
-static bool menu_splash_active(void){return true;}
+static bool boot_window_active(void){return true;}
 static void vTaskDelay(unsigned n){assert(n==2);}
 static metrics_t measure_window(const uint8_t *s,unsigned n){(void)s;(void)n;return (metrics_t){0};}
 static bool copy_probe_window(uint8_t *s,void *node){

@@ -1,6 +1,11 @@
 /* C5VRX-5 by Twotoz and the C5VRX contributors: 50 ms control loop.
  * BOOT button and menu, AFC acquisition, PAL/NTSC detection, signal
- * strength and the channel scanner. Observes completed RX descriptors only. */
+ * strength and the channel scanner. Observes completed RX descriptors only.
+ *
+ * c5div-rx modifications: no menu, no channel scanner, no console commands,
+ * no AUTO OUTPUT/decoder switching/flight log; the BOOT button cycles the
+ * eight raceband channels (see control_task). AFC, standard detection,
+ * signal strength, video quality and the live profile switch are unchanged. */
 #include "receiver.h"
 #define PICTURE_YIELD() taskYIELD()   /* the gain observer shares priority 3 */
 #include "picture_sync.h"
@@ -9,10 +14,8 @@
 #include <string.h>
 #include "afc_ctrl.h"
 #include "output_level.h"
-#include "output_auto.h"
 #include "profile_logic.h"
 #include "cn_estimate.h"
-#include "analog_video_detect.h"
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -20,23 +23,38 @@
 #include "phy.h"
 #include "snapshot.h"
 #include "rf.h"
-#include "flightlog.h"
-#include "experimental.h"
-#include "flightlog_format.h"
 
 #define BOOT_BUTTON      GPIO_NUM_28    /* XIAO ESP32-C5 BOOT */
+/* c5div-rx: external button to GND on XIAO D10 (free: no clock export). One
+ * button wired to D10 of both receivers of a diversity pair drives both. */
+#define EXT_BUTTON       GPIO_NUM_10
 #define TICK_MS          50
-#define LONG_TICKS       12             /* 0.6 s */
-#define MENU_IDLE_TICKS  600            /* 30 s without a press closes the menu */
-#define DAC_IDLE_TICKS   6000           /* 5 min on the bench-only DAC TEST page */
+#define HOLD_R1_TICKS    40             /* 2 s: back to R1 */
+#define HOLD_CAL_TICKS   160            /* 8 s: one-time filter calibration */
+#define ARM_TICKS        10             /* an input counts only after 0.5 s released */
+#define STUCK_TICKS      300            /* 15 s held: ignore that input until released */
+
+/* An input becomes a button only after it has been seen released (high)
+ * for ARM_TICKS, and a hold of STUCK_TICKS disarms it until it is released
+ * again. A D10 line that is shorted or pulled to ground can then never
+ * start calibration after calibration (seen on the first board: an input
+ * read low from boot, every ~13 s a "long hold" took the video for ~10 s). */
+static unsigned s_btn_high[2];
+static bool s_btn_armed[2];
+static bool button_input(int k, gpio_num_t pin)
+{
+    if (gpio_get_level(pin)) {
+        if (s_btn_high[k] < ARM_TICKS && ++s_btn_high[k] == ARM_TICKS) s_btn_armed[k] = true;
+        return false;
+    }
+    s_btn_high[k] = 0;
+    return s_btn_armed[k];
+}
 #define RETUNE_SETTLE_TICKS 10          /* 500 ms after a PHY transaction */
-#define SCAN_PAIRS       4092u
 #define CONTROL_STACK_BYTES 6144u
 
 typedef struct {
     StaticTask_t task;
-    StaticQueue_t commands;
-    uint8_t command_storage[16u * sizeof(int)];
     StackType_t stack[CONTROL_STACK_BYTES/sizeof(StackType_t)] __attribute__((aligned(portBYTE_ALIGNMENT)));
 } control_memory_t;
 static control_memory_t *s_control_memory;
@@ -51,39 +69,24 @@ bool control_prepare(void)
     return s_control_memory!=NULL;
 }
 
-volatile bool s_menu_active;
-static bool menu_open_checked(void)
-{
-    if (!menu_open()) return false;
-    s_menu_cursor = 0;
-    s_cal_sub = -1;
-    return true;
-}
 volatile int s_signal_strength;
 volatile bool s_scan_active;
-volatile unsigned s_scan_progress;
 volatile int s_cfo_khz;
 volatile bool s_afc_locked;
 volatile bool s_afc_enabled = true;
 volatile std_mode_t s_std_mode = STD_MODE_AUTO;
-volatile video_standard_t s_video_std = VIDEO_STD_NTSC;
 volatile bool s_detected_std_valid;
 volatile video_standard_t s_detected_std = VIDEO_STD_NTSC;
 volatile int64_t s_last_video_us;
-QueueHandle_t s_commands;
 
 /* One control-task scratch buffer: the control window (gain), then the
- * longer AFC window over it, and during a scan (receiver paused) a separate
- * endpoint area. Saves the scan's malloc. */
-#define SCAN_BUF_OFFSET 4096u
+ * longer AFC window over it. */
 #define AFC_WINDOW_BYTES C5V4_LEVEL_SAMPLE_BYTES
-#define CONTROL_SCRATCH_BYTES (SCAN_BUF_OFFSET + SCAN_PAIRS > AFC_WINDOW_BYTES ? \
-                               SCAN_BUF_OFFSET + SCAN_PAIRS : AFC_WINDOW_BYTES)
+#define CONTROL_SCRATCH_BYTES (CONTROL_BYTES > AFC_WINDOW_BYTES ? CONTROL_BYTES : AFC_WINDOW_BYTES)
 static uint8_t s_control_scratch[CONTROL_SCRATCH_BYTES];
 static uint8_t *const s_window = s_control_scratch;
 static uint8_t *const s_afc_window = s_control_scratch;
 static uint8_t s_pal_votes, s_ntsc_votes;
-static uint8_t s_last_std = 0xFF;      /* last stable standard (NVS) */
 static unsigned s_afc_corrections, s_afc_weak_skips;
 typedef struct {
     afc2_evidence_t history;
@@ -107,7 +110,7 @@ static void standard_reset(void)
 }
 
 /* Burst-confirmed standard from the AFC estimator; a few agreeing
- * windows make it stable and remembered for the next boot's menu. */
+ * windows make it stable. */
 static void standard_vote(unsigned afc_standard)
 {
     bool pal = afc_standard == 2u;
@@ -115,18 +118,6 @@ static void standard_vote(unsigned afc_standard)
     else { if (s_ntsc_votes < 8u) ++s_ntsc_votes; if (s_pal_votes) --s_pal_votes; }
     if (s_pal_votes >= 3u && s_pal_votes >= s_ntsc_votes + 2u) { s_detected_std = VIDEO_STD_PAL; s_detected_std_valid = true; }
     else if (s_ntsc_votes >= 3u && s_ntsc_votes >= s_pal_votes + 2u) { s_detected_std = VIDEO_STD_NTSC; s_detected_std_valid = true; }
-    if (s_detected_std_valid && s_last_std != (uint8_t)s_detected_std) {
-        s_last_std = (uint8_t)s_detected_std;
-        (void)blob_store("last_std", &s_last_std, 1);
-    }
-}
-
-video_standard_t menu_standard(void)
-{
-    if (s_std_mode == STD_MODE_PAL) return VIDEO_STD_PAL;
-    if (s_std_mode == STD_MODE_NTSC) return VIDEO_STD_NTSC;
-    if (s_detected_std_valid) return s_detected_std;
-    return s_last_std == VIDEO_STD_PAL ? VIDEO_STD_PAL : VIDEO_STD_NTSC;
 }
 
 /* 0..100 from phase coherence, envelope and gain headroom. */
@@ -143,311 +134,16 @@ static int strength(const metrics_t *m, uint8_t gain)
     return (coherence * 2 + power + headroom) / 4;
 }
 
-/* Decoder P64 -> U85Q -> U50P64 -> D32 (console m, menu DEMOD), kept in NVS TRANSPORT_DEMOD_KEY: live, a
- * verified restart behind the shared 5 s guard; in the menu, applied by the
- * restart on menu exit. */
-static void demod_next(void)
-{
-    const uint8_t next = (uint8_t)((transport_demod() + 1u) % TRANSPORT_DEMODS);
-    const bool ok = transport_set_demod(next);
-    if (ok) (void)blob_store(TRANSPORT_DEMOD_KEY, &next, sizeof(next));
-    printf("DEMOD switch to=%s result=%s active=%s%s\n", transport_demod_name(next), ok ? "ok" : "refused",
-           transport_program_name(), ok ? "" : " (guard, fault or rollback: T TRANSPORT and DEMOD)");
-}
-
-/* U50P64-R1 follows at most ~5 MHz of instantaneous frequency (loop gain
- * 0.5) and loses to U80P64-R1 from deviation ~1.2 in the host model
- * (research/u50p64.py): on a VTX measured wider than U50P64_MAX_DEV_X100 the
- * session falls back to U80P64-R1. The stored choice is kept: the next boot
- * starts on it again and decides again on its own measurement. */
-#define U50P64_MAX_DEV_X100 110
-static uint32_t s_demod_fallbacks;
-static void demod_deviation_guard(void)
-{
-    if (transport_demod() != TRANSPORT_DEMOD_U50P64 || s_menu_active) return;
-    const int dev = profile_live_deviation_x100();
-    if (dev < U50P64_MAX_DEV_X100) return;
-    if (!transport_set_demod(TRANSPORT_DEMOD_P64)) return;   /* guard: the next window asks again */
-    ++s_demod_fallbacks;
-    printf("DEMOD fallback to=%s deviation_x100=%d limit=%d (U50P64-R1 is for deviation <= ~1.0)\n",
-           transport_program_name(), dev, U50P64_MAX_DEV_X100);
-}
-
 static void after_retune(void)
 {
     ++s_control_epoch;
-    {
-        uint8_t e[3] = {(uint8_t)rf_channel_index()};
-        flog_put16(e + 1, rf_frequency_mhz());
-        flightlog_event(FLOG_E_CHANNEL, e, sizeof(e));
-    }
     s_cfo_khz = 0;
     s_afc_locked = false;
     standard_reset();
     settings_save();
     profile_channel_changed();   /* another channel may carry another VTX */
-    if (s_menu_active) menu_render();
     printf("[CHANNEL] %s %u MHz%s\n", rf_channel()->name, rf_channel()->freq_mhz,
            rf_freq_in_spec(rf_channel()->freq_mhz) ? "" : " (above the documented C5 range, not characterised)");
-}
-
-/* ---- Channel scanner -------------------------------------------------------
- * RF strength alone let 5 GHz Wi-Fi win (issue #128): a channel only
- * qualifies with analog-video confidence (line-period periodicity), and its
- * carrier must sit within 3 MHz of the channel centre (a VTX also shows on
- * neighbouring channels through the filter, and the 50 ns offset estimate
- * wraps every 20 MHz). Among centred candidates the strongest wins. */
-_Static_assert(SCAN_BUF_OFFSET >= CONTROL_BYTES, "scan endpoints must not overlap the control window");
-static uint8_t *const s_scan_buf = s_control_scratch + SCAN_BUF_OFFSET;
-
-static analog_video_t scan_confidence(void)
-{
-    analog_video_t v[3] = {{0}};
-    for (unsigned w = 0; w < 3u; ++w) {
-        if (w) vTaskDelay(pdMS_TO_TICKS(10));
-        if (copy_recent_endpoints(s_scan_buf, SCAN_PAIRS))
-            v[w] = analog_video_detect(s_scan_buf, SCAN_PAIRS, c5vrx_phase8_gain_lut);
-    }
-    analog_video_t a = v[0], b = v[1], c = v[2], t;   /* median by confidence */
-    if (a.confidence > b.confidence) { t = a; a = b; b = t; }
-    if (b.confidence > c.confidence) { t = b; b = c; c = t; }
-    if (a.confidence > b.confidence) { t = a; a = b; b = t; }
-    return b;
-}
-
-static analog_video_t channel_confidence(uint8_t scan_gain, uint8_t max_gain, int *quality)
-{
-    vTaskDelay(pdMS_TO_TICKS(90));
-    metrics_t m = {0};
-    if (copy_control_window(s_window, CONTROL_BYTES)) m = measure_window(s_window, CONTROL_BYTES);
-    if (quality) *quality = strength(&m, scan_gain);
-    analog_video_t video = scan_confidence();
-    /* A far VTX is starved at the scan gain: look again at maximum. */
-    if (video.confidence < ANALOG_VIDEO_MIN_CONFIDENCE && m.origin_pm > 500) {
-        receiver_set_gain(max_gain);
-        vTaskDelay(pdMS_TO_TICKS(20));
-        analog_video_t far = scan_confidence();
-        receiver_set_gain(scan_gain);
-        if (far.confidence > video.confidence) video = far;
-    }
-    return video;
-}
-
-static void scan(void)
-{
-    if (!receiver_pause("SCAN")) return;
-    const size_t original = rf_channel_index();
-    const uint8_t max_gain = rf_gain_table()->max_index, scan_gain = 52u;
-    size_t best = original;
-    int best_quality = -1, best_video = -1, best_offset = 0x7fffffff;
-    s_scan_active = true;
-    s_scan_progress = 0;
-    receiver_set_gain(scan_gain);   /* every channel compared at one gain */
-    for (size_t ch = 0; ch < FPV_CHANNELS; ++ch) {
-        s_scan_progress = (unsigned)(ch * 100u / FPV_CHANNELS);
-        if (s_menu_active) menu_render();
-        if (rf_set_channel(ch) != ESP_OK) continue;
-        int quality = 0;
-        analog_video_t v = channel_confidence(scan_gain, max_gain, &quality);
-        if (v.confidence < ANALOG_VIDEO_MIN_CONFIDENCE) continue;
-        int off = abs(v.offset_khz);
-        printf("SCAN candidate %s %u MHz video=%d offset_khz=%d quality=%d %s\n", rf_channel()->name,
-               rf_channel()->freq_mhz, v.confidence, v.offset_khz, quality, v.standard == 1 ? "PAL" : "NTSC");
-        bool centred = off <= 3000, best_centred = best_offset <= 3000;
-        if ((centred && !best_centred) ||
-            (centred == best_centred &&
-             (quality > best_quality ||
-              (quality == best_quality &&
-               (off / 500 < best_offset / 500 ||
-                (off / 500 == best_offset / 500 && v.confidence > best_video)))))) {
-            best = ch;
-            best_quality = quality;
-            best_video = v.confidence;
-            best_offset = off;
-        }
-    }
-    /* Confirm the winner: still video, still centred. */
-    if (best_video >= 0) {
-        (void)rf_set_channel(best);
-        analog_video_t v = channel_confidence(scan_gain, max_gain, NULL);
-        if (v.confidence < ANALOG_VIDEO_MIN_CONFIDENCE || abs(v.offset_khz) > 3000) best_video = -1;
-    }
-    if (best_video < 0) best = original;
-    (void)rf_set_channel(best);
-    s_scan_active = false;
-    receiver_set_gain(max_gain);
-    receiver_resume();
-    printf("SCAN result=%s channel=%s\n", best_video < 0 ? "none_kept" : "found", rf_channel()->name);
-    after_retune();
-}
-
-/* ---- Menu actions ---------------------------------------------------------- */
-static void cycle_video_standard(void)
-{
-    menu_set_standard_mode(s_std_mode == STD_MODE_AUTO ? STD_MODE_NTSC :
-                           s_std_mode == STD_MODE_NTSC ? STD_MODE_PAL : STD_MODE_AUTO);
-    settings_save();
-}
-
-/* AFC OFF returns the synthesizer to the exact channel centre (0 kHz offset). */
-/* Menu choices kept across reboots (settings prefs). */
-static void prefs_save(void)
-{
-    const uint8_t gain = receiver_gain_mode();
-    const settings_prefs_t p = {SETTINGS_PREFS_VERSION, (int8_t)profile_selected(),
-                                receiver_gain_mode_auto(gain) ? gain : (uint8_t)GAIN_MODE_DEFAULT,
-                                (uint8_t)phy_dfilt_mode()};
-    settings_prefs_store(&p);
-}
-
-/* Menu PHY FILT: the digital RX filter mode 12 -> 0 -> 4 -> 8 (saved;
- * phy.h). A different transfer function changes the receiver noise
- * (PR #244: +0.24..+0.73 dB between modes) and the IQ the DC servo trims,
- * so the gain observation restarts on the new mode. */
-static void cycle_dfilt(void)
-{
-    const int want = phy_dfilt_next(phy_dfilt_mode());
-    const bool ok = phy_dfilt_select(want);
-    receiver_dc_reset_all();
-    if (ok) prefs_save();
-    printf("[DFILT] mode=%d requested=%d applied=%u hw=%d (saved; boot default %d)\n", phy_dfilt_mode(), want,
-           ok, phy_dfilt_hw_mode(), PHY_DFILT_MODE_DEFAULT);
-}
-
-static void toggle_afc(void)
-{
-    s_afc_enabled = !s_afc_enabled;
-    s_afc_locked = false;
-    s_cfo_khz = 0;
-    if (!s_afc_enabled && rf_offset_khz() != 0) {
-        rf_set_offset_khz(0);
-        s_last_gain_write_us = esp_timer_get_time();
-        ++s_gain_epoch;
-    }
-    ++s_control_epoch;
-    const uint8_t off = !s_afc_enabled;
-    (void)blob_store("afc_off", &off, 1);
-    printf("[AFC] mode=%s offset_khz=%d\n", s_afc_enabled ? "ON" : "OFF", rf_offset_khz());
-}
-
-/* Press: the next row, in the CALIBRATE submenu while it is open. */
-static void menu_next(void)
-{
-    s_exp_failed = false;
-    if (s_exp_sub >= 0) s_exp_sub = (s_exp_sub + 1) % EXP_MENU_ITEMS;
-    else if (s_cal_sub >= 0) s_cal_sub = (s_cal_sub + 1) % MENU_CAL_ITEMS;
-    else s_menu_cursor = (s_menu_cursor + 1) % MENU_ITEMS;
-    menu_render();
-}
-
-static void menu_action(void)
-{
-    if (s_exp_sub >= 0) {
-        const unsigned k = (unsigned)s_exp_sub;
-        uint8_t before[EXP_ITEMS], after[EXP_ITEMS];
-        experimental_snapshot(before);
-        s_exp_failed = false;
-        if (k == EXP_BACK) s_exp_sub = -1;
-        else if (k == EXP_RESET) {
-            experimental_reset();
-            receiver_set_gain_mode(GAIN_MODE_DEFAULT, true);
-            if (!phy_dfilt_select(PHY_DFILT_MODE_DEFAULT)) s_exp_failed = true;
-            if (!s_afc_enabled) toggle_afc();
-            if (!transport_set_demod(TRANSPORT_DEMOD_DEFAULT)) s_exp_failed = true;
-            else { const uint8_t d = TRANSPORT_DEMOD_DEFAULT; (void)blob_store(TRANSPORT_DEMOD_KEY, &d, 1); }
-            prefs_save();
-        }
-        else if (k == EXP_DAC) menu_dac_step();
-        else if (k == EXP_GAIN) { receiver_set_gain_mode(receiver_gain_mode_next(receiver_gain_mode()), true); prefs_save(); }
-        else if (k == EXP_DFILT) cycle_dfilt();
-        else if (k == EXP_AFC) toggle_afc();
-        else if (k == EXP_DEMOD) demod_next();
-        else if (k < EXP_ITEMS) s_exp_failed = !experimental_set(k, (experimental_get(k) + 1u) % experimental_items[k].count);
-        experimental_snapshot(after);
-        for (unsigned i = 0; i < EXP_IQ_CORR; ++i) if (before[i] != after[i]) {
-            const uint8_t e[] = {(uint8_t)i, before[i], after[i], 1};
-            flightlog_event(FLOG_E_EXP, e, sizeof(e));
-        }
-        experimental_log_state();
-        menu_render();
-        return;
-    }
-    if (s_cal_sub >= 0) {   /* CALIBRATE submenu: QUICK = console F, FULL = console B */
-        const int k = s_cal_sub;
-        s_cal_sub = -1;
-        if (k == MENU_CAL_QUICK) { menu_close(); filter_request(); return; }        /* runs once the menu is closed */
-        if (k == MENU_CAL_FULL) { menu_close(); filter_request_full(); return; }
-        menu_render();
-        return;
-    }
-    switch (s_menu_cursor) {
-    case MENU_BAND: rf_next_band(); after_retune(); break;
-    case MENU_CHANNEL: rf_next_channel(); after_retune(); break;
-    case MENU_SCAN: scan(); break;
-    case MENU_FILTER: (void)profile_select_cycle(); prefs_save(); break;
-    case MENU_AFC: toggle_afc(); break;
-    case MENU_DFILT: cycle_dfilt(); break;
-    case MENU_EXPERIMENTAL: s_exp_sub = 0; break;
-    case MENU_CALIBRATE: s_cal_sub = MENU_CAL_QUICK; break;   /* opens the QUICK / FULL / BACK submenu */
-    case MENU_OUTPUT: (void)transport_set_output((transport_output() + 1u) % OUTPUT_LEVELS); break;
-    case MENU_GAIN: receiver_set_gain_mode(receiver_gain_mode_next(receiver_gain_mode()), true); prefs_save(); break;
-    case MENU_DEMOD: demod_next(); break;   /* applied by the verified restart on menu exit */
-    case MENU_DAC: menu_dac_step(); break;
-    case MENU_VIDEO:
-        cycle_video_standard();
-        break;
-    default: menu_close(); return;
-    }
-    if (s_menu_active) menu_render();
-}
-
-static void command(int c, unsigned *menu_idle)
-{
-    *menu_idle = 0;
-    if (menu_status_active()) {   /* a calibration owns the picture */
-        printf("COMMAND %c refused=busy (a calibration or lane test owns the picture; retry when it ends)\n", c);
-        return;
-    }
-    switch (c) {
-    case 'G': receiver_set_gain_mode(receiver_gain_mode_next(receiver_gain_mode()), true); prefs_save(); break;
-    /* Decoder P64 -> U85Q -> U50P64: a verified restart behind the shared 5 s guard. */
-    case 'm': demod_next(); break;
-    /* Bench: the real gain step of every table row pair (receiver.c). */
-    case 'Q': receiver_pair_sweep_toggle(); break;
-    /* DAC self-test: open the menu on DAC TEST, then step like a hold. */
-    case 'Z':
-        if (!s_menu_active && !menu_open_checked()) break;
-        if (s_exp_sub != EXP_DAC || s_cal_sub >= 0) { s_cal_sub = -1; s_menu_cursor = MENU_EXPERIMENTAL; s_exp_sub = EXP_DAC; menu_render(); }
-        else menu_dac_step();
-        break;
-    case 'o': if (s_menu_active) menu_close(); else (void)menu_open_checked(); break;
-    case 'e': menu_close(); break;  /* idempotent web-menu EXIT */
-    case 'v': cycle_video_standard(); break;
-    case 'f': (void)profile_select_cycle(); prefs_save(); if (s_menu_active) menu_render(); break;   /* menu FILTER hold */
-    case 'n': if (s_menu_active) menu_next(); break;
-    case 'x': if (s_menu_active) menu_action(); break;
-    case 'c': rf_next_channel(); after_retune(); break;
-    case 'b': rf_next_band(); after_retune(); break;
-    case 's': scan(); break;
-    case 'A': {
-        profile_set_live_mode(!profile_live_mode());
-        printf("PROFILE live switch %s (saved): %s\n", profile_live_mode() ? "ON" : "OFF",
-               profile_live_mode() ? "widen after one reliable result, narrow after two agreeing results"
-                                   : "report only, PENDING for the next boot or CALIBRATE");
-        break;
-    }
-    case 'g': {
-        unsigned next = (transport_output() + 1u) % OUTPUT_LEVELS;
-        bool ok = transport_set_output(next);
-        printf("OUTPUT manual %s result=%s wait_ms=%lu%s\n", transport_output_name(),
-               ok ? "applied" : "refused", (unsigned long)transport_switch_wait_ms(),
-               transport_output() == 9 ? " (low swing: halves noise & clipping; requires sensitive sync)" :
-               (transport_output() ? " WARNING: may clip wide VTX; verify sync/white into 75 ohm" : ""));
-        if (s_menu_active) menu_render();
-        break;
-    }
-    default: break;
-    }
 }
 
 static uint32_t afc_context(void)
@@ -469,66 +165,6 @@ static uint32_t s_vq_periods;
 /* Picture measure totals and its CPU cost per window (T PICTURE). */
 static struct { picture_state_t state; uint32_t found, expected, windows, us_max; uint64_t us_sum; } s_pic;
 
-/* AUTO OUTPUT (output_auto.h): the video level from the measured sync tip,
- * sync depth and peak white of the live decoder. Context: the channel and
- * the decoder; another one starts from the manual level again. */
-static output_auto_t s_out_auto;
-static uint32_t s_out_auto_key = UINT32_MAX;
-static uint32_t s_out_auto_windows, s_out_auto_refused;
-static void output_auto_service(bool sync_confirmed, const afc2_result_t *r, bool picture, const picture_sync_t *ps,
-                                int64_t now)
-{
-    const bool on = experimental_get(EXP_OUTPUT_AUTO) != 0u && transport_output() == 0u && !s_menu_active;   /* OFF by default */
-    const uint32_t key = (uint32_t)rf_channel_index() << 8 | transport_demod();
-    if (!on || key != s_out_auto_key) {
-        /* Back to the manual level first; a refusal (the shared guard) is
-         * tried again on the next window. Then measure this context afresh. */
-        if (s_menu_active) return;
-        if (!transport_set_output_affine(0u)) return;
-        if (s_out_auto.word) printf("OUTPUT auto reset (%s)\n", on ? "context" : "off");
-        output_auto_reset(&s_out_auto);
-        s_out_auto_key = on ? key : UINT32_MAX;
-        return;
-    }
-    /* The remembered word must be the one that is live: a manual OUTPUT
-     * cycled away from 1.0x and back inside one menu visit, or a rollback of
-     * another restart, clears the affine word while channel and decoder stay
-     * the same. Without this the next candidates matched the remembered word
-     * and AUTO OUTPUT never applied again in that context. */
-    if (s_out_auto.word && transport_output_word() != s_out_auto.word) {
-        printf("OUTPUT auto reset (live output changed)\n");
-        output_auto_reset(&s_out_auto);
-    }
-    /* Confirmed sync below blanking, at least 80 % of this window's sync
-     * pulses, levels apart from the bulk: else nothing is learned. */
-    if (!sync_confirmed || r->polarity >= 0 || !picture || !s_pic.state.levels || !ps->expected ||
-        ps->found * 5u < ps->expected * 4u) return;
-    const int32_t depth_khz = r->porch_khz - r->sync_khz;
-    if (depth_khz <= 0) return;
-    ++s_out_auto_windows;
-    /* DAC codes x4: 63 codes over -6..+9 MHz. */
-    const unsigned depth_x4 = (unsigned)(depth_khz * 252 / 15000);
-    unsigned word;
-    if (!output_auto_observe(&s_out_auto, s_pic.state.tip_x4, s_pic.state.top_x4, depth_x4, now, &word)) return;
-    if (transport_set_output_affine(word)) {
-        output_auto_applied(&s_out_auto, word, now);
-        const uint8_t e[3] = {(uint8_t)output_affine_gain_q3(word), (uint8_t)output_affine_tip(word),
-                              (uint8_t)(s_out_auto.last_depth_x4 > 255u ? 255u : s_out_auto.last_depth_x4)};
-        flightlog_event(FLOG_E_OUTPUT_AUTO, e, sizeof(e));
-        printf("OUTPUT auto gain_x8=%u src_tip=%u depth_x4=%u span_x4=%u (%s)\n", output_affine_gain_q3(word),
-               output_affine_tip(word), s_out_auto.last_depth_x4, s_out_auto.last_span_x4, transport_output_name());
-    } else ++s_out_auto_refused;   /* guard or rollback: the candidate stays, the next batch asks again */
-}
-void output_auto_print(void)
-{
-    printf("OUTPUT_AUTO enabled=%u word_gain_x8=%u src_tip=%u batches=%lu rejected=%lu applied=%lu refused=%lu "
-           "windows=%lu tip_x4=%u depth_x4=%u span_x4=%u live=%s\n", experimental_get(EXP_OUTPUT_AUTO) != 0u,
-           s_out_auto.word ? output_affine_gain_q3(s_out_auto.word) : 8u, s_out_auto.word ? output_affine_tip(s_out_auto.word) : 0u,
-           (unsigned long)s_out_auto.batches, (unsigned long)s_out_auto.rejected, (unsigned long)s_out_auto.applied,
-           (unsigned long)s_out_auto_refused, (unsigned long)s_out_auto_windows, s_out_auto.last_tip_x4,
-           s_out_auto.last_depth_x4, s_out_auto.last_span_x4, transport_output_name());
-}
-
 static bool copy_afc_window(uint8_t *dst)
 {
     vTaskSuspendAll();
@@ -544,55 +180,41 @@ static void control_task(void *arg)
     uint8_t seen_sign_state = afc.sign_state;
     bool own_write = false;
     uint8_t afc_lost = 0;
-    unsigned settle = RETUNE_SETTLE_TICKS, btn = 0, boot_grace = 20, menu_idle = 0, menu_refresh = 0;
-    bool long_fired = false, was_locked = false;
+    unsigned settle = RETUNE_SETTLE_TICKS, btn = 0, boot_grace = 20;
+    bool was_locked = false;
     uint32_t seen_phy = phy_generation(), seen_control = s_control_epoch;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(TICK_MS));
-        int c;
-        experimental_poll();
-        for (unsigned k = 0; k < 8 && xQueueReceive(s_commands, &c, 0) == pdTRUE; ++k) command(c, &menu_idle);
 
-        /* BOOT button: short = next channel (menu: next item); 0.6 s = menu
-         * (menu: do the selected item). */
-        /* A calibration status screen or the boot logo owns the picture: no
-         * menu, no idle exit. */
-        if (menu_status_active() || menu_splash_active()) {
-            btn = 0; long_fired = false; menu_idle = 0; continue;
-        }
-        if (boot_grace) { --boot_grace; btn = 0; long_fired = false; }
-        else if (gpio_get_level(BOOT_BUTTON) == 0) {
+        /* c5div-rx: the BOOT button is the only control.
+         *   press           next raceband channel (R1..R8, then R1)
+         *   hold 2 s        back to R1: with one button wired to both
+         *                   receivers of a diversity pair this re-aligns them
+         *   hold 8 s        one-time filter calibration, video stops ~30 s
+         *                   (C5VRX-5 menu CALIBRATE > QUICK / console F)
+         * BOOT and D10 (external, to GND) act the same. Calibration and the
+         * boot window own TX: no button, no AFC. */
+        if (status_hold_active() || boot_window_active()) { btn = 0; continue; }
+        const bool b_boot = button_input(0, BOOT_BUTTON), b_ext = button_input(1, EXT_BUTTON);
+        if (boot_grace) { --boot_grace; btn = 0; }
+        else if (b_boot || b_ext) {
             ++btn;
-            menu_idle = 0;
-            if (btn >= LONG_TICKS && !long_fired) {
-                long_fired = true;
-                if (!s_menu_active) (void)menu_open_checked();
-                else menu_action();
+            if (btn == STUCK_TICKS) {
+                if (b_boot) s_btn_armed[0] = false;
+                if (b_ext) s_btn_armed[1] = false;
+                printf("[BUTTON] %s held 15 s: ignored until released\n", b_ext ? "D10" : "BOOT");
+                btn = 0;
+            } else if (btn == HOLD_R1_TICKS) {
+                printf("[BUTTON] hold: R1\n");
+                if (rf_channel_index() != 0 && rf_set_channel(0) == ESP_OK) after_retune();
+            } else if (btn == HOLD_CAL_TICKS) {
+                printf("[BUTTON] long hold: filter calibration\n");
+                filter_request();
             }
         } else if (btn) {
-            if (!long_fired && btn >= 2) {
-                if (s_menu_active) menu_next();
-                else { rf_next_channel(); after_retune(); }
-            }
+            if (btn >= 2 && btn < HOLD_R1_TICKS) { rf_next_channel(); after_retune(); }
             btn = 0;
-            long_fired = false;
         }
-        if (s_menu_active) {
-            /* The dBm on the CHANNEL page: the gain observer stands still in
-             * the menu, so its control windows feed the level, rolled once a
-             * second (20 ticks). */
-            static uint8_t level_ticks;
-            if (copy_control_window(s_window, CONTROL_BYTES)) receiver_level_feed(s_window, CONTROL_BYTES);
-            if (++level_ticks >= 20u) { level_ticks = 0; receiver_level_roll(false, false); }
-            /* A multimeter needs longer than 30 s; the page is only reached
-             * by pressing through the menu. */
-            const unsigned idle_limit = (s_exp_sub == EXP_DAC || s_menu_cursor == MENU_DAC) ? DAC_IDLE_TICKS : MENU_IDLE_TICKS;
-            if (++menu_idle >= idle_limit) {
-                menu_close();
-                printf("[MENU] closed after %u s idle\n", idle_limit * TICK_MS / 1000u);
-            }
-            else if (++menu_refresh >= 5) { menu_refresh = 0; menu_render(); }
-        } else menu_idle = menu_refresh = 0;
 
         transport_poll_faults();
         if (phy_generation() != seen_phy || s_control_epoch != seen_control) {
@@ -608,7 +230,6 @@ static void control_task(void *arg)
             memset(&s_afc_evidence, 0, sizeof(s_afc_evidence));
             s_afc_evidence.window="scan"; s_afc_evidence.held="scan";
             s_afc_evidence.cn_x10=CN_UNKNOWN_X10;
-            diag_window(false, false, false);
             continue;
         }
         const bool copied = copy_control_window(s_window, CONTROL_BYTES);
@@ -637,16 +258,13 @@ static void control_task(void *arg)
         /* Picture measure (picture_sync.h): every live window, also those the
          * AFC leaves out (a gain write, settle, fading): the goggles see those. */
         picture_sync_t ps = {0, 0};
-        bool picture = false;
-        if (copied && !s_menu_active && (afc_copied || copy_afc_window(s_afc_window))) {
+        if (copied && (afc_copied || copy_afc_window(s_afc_window))) {
             unsigned bits;
             const uint16_t *lut = transport_decoder_lut(&bits);
             if (lut) {
                 const int64_t t0 = esp_timer_get_time();
                 ps = picture_sync_window(&s_pic.state, s_afc_window, AFC_WINDOW_BYTES, lut, bits);
-                picture = true;
                 const uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
-                if (ps.expected) diag_picture(ps.found, ps.expected);
                 s_pic.found += ps.found; s_pic.expected += ps.expected; ++s_pic.windows;
                 s_pic.us_sum += us;
                 if (us > s_pic.us_max) s_pic.us_max = us;
@@ -675,8 +293,6 @@ static void control_task(void *arg)
             s_afc_evidence.residual_khz=r.porch_khz-afc.target_khz;
         }
         if (valid) { s_last_video_us = now; standard_vote(r.standard); profile_observe(&r); }
-        output_auto_service(valid && gain_epoch == s_gain_epoch, &r, picture, &ps, now);
-        demod_deviation_guard();
         if (!s_afc_enabled && rf_offset_khz() != 0) {
             rf_set_offset_khz(0);
             s_last_gain_write_us = esp_timer_get_time();
@@ -691,8 +307,8 @@ static void control_task(void *arg)
          * walk the offset the wrong way (cn_estimate.h, afc_bias.py). A weak
          * window still feeds the estimate history, it just cannot step. */
         const int cn_x10 = receiver_obs_cn_x10();
-        const char *afc_held = !s_afc_enabled ? "afc_off" : s_afc_locked ? "sticky_lock" : !valid ? "window" : s_menu_active ? "menu" : "actuator";
-        if (s_afc_enabled && !s_afc_locked && valid && !s_menu_active &&
+        const char *afc_held = !s_afc_enabled ? "afc_off" : s_afc_locked ? "sticky_lock" : !valid ? "window" : "actuator";
+        if (s_afc_enabled && !s_afc_locked && valid &&
             phy_try_actuator(phy_generation())) {
             int32_t step = 0;
             const bool strong = receiver_obs_cn_x10() >= AFC_MIN_CN_X10;   /* noise-referenced power C/N */
@@ -736,7 +352,6 @@ static void control_task(void *arg)
                 s_afc_sign_saved = blob_store("afc_sign", &sign, 1);
             }
         }
-        diag_window(window_ok, valid, own_write);   /* own_write: an AFC step this window */
         if (s_afc_locked && !was_locked)
             printf("[VIDEO] locked %s %u MHz %s offset_khz=%d gain=%u\n", rf_channel()->name,
                    rf_channel()->freq_mhz, r.standard == 2 ? "PAL" : "NTSC", rf_offset_khz(), s_current_gain);
@@ -747,28 +362,23 @@ static void control_task(void *arg)
 void control_start(void)
 {
     const gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << BOOT_BUTTON,
+        .pin_bit_mask = (1ULL << BOOT_BUTTON) | (1ULL << EXT_BUTTON),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
-    if (!blob_load("last_std", &s_last_std, 1)) s_last_std = 0xFF;
-    uint8_t afc_off = 0;
-    if (blob_load("afc_off", &afc_off, 1)) s_afc_enabled = !afc_off;
-    profile_set_live_mode(experimental_get(EXP_AUTO_PROFILE) != 0);
-    experimental_log_state();
+    printf("BUTTON inputs at start: BOOT(GPIO28)=%d D10(GPIO10)=%d (1 = released)\n", gpio_get_level(BOOT_BUTTON),
+           gpio_get_level(EXT_BUTTON));
+    /* AFC is always on (C5VRX-5's saved "afc_off" menu choice is ignored);
+     * the live profile switch stays in its C5VRX-5 default (report only). */
+    profile_set_live_mode(false);
     int8_t sign;
     if (blob_load("afc_sign", &sign, 1) && (sign == 1 || sign == -1)) {
         s_afc_sign = sign;
         s_afc_sign_state = AFC2_SIGN_CONFIRMED;
         s_afc_sign_saved = true;
     }
-    /* Queue storage shares the early reservation: the optional splash must
-     * not consume the final heap bytes needed by control startup either. */
-    s_commands = xQueueCreateStatic(16, sizeof(int), s_control_memory->command_storage,
-                                   &s_control_memory->commands);
-    ESP_ERROR_CHECK(s_commands ? ESP_OK : ESP_ERR_NO_MEM);
     /* IDF task stack depths are bytes. Reserve before driver allocations,
      * then supply that same 6144-byte stack and TCB without another malloc. */
     ESP_ERROR_CHECK(control_prepare() &&
@@ -781,25 +391,17 @@ void control_start(void)
  * without a status request. Read-only. */
 void control_print_beat(void)
 {
-    if (experimental_mask()) printf("EXP active=0x%08lx reboot=%u\n", (unsigned long)experimental_mask(), experimental_reboot_needed());
     /* video: confirmed sync within 0.5 s (the web menu's VIDEO/SEARCH);
      * afc_locked alone said SEARCH over a good picture without a lock. */
     const int64_t video_at = s_last_video_us;
-    printf("STATUS channel=%s freq=%u afc_locked=%u video=%u standard=%s detected=%s signal=%d menu=%u mode=%s demod=%s "
+    printf("STATUS channel=%s freq=%u afc_locked=%u video=%u standard=%s detected=%s signal=%d hold=%u mode=%s demod=%s "
            "output=%s live=%u busy=%u fw=%s\n",
            rf_channel()->name, rf_frequency_mhz(), s_afc_locked,
            video_at && esp_timer_get_time() - video_at < 500000,
            s_std_mode == STD_MODE_AUTO ? "AUTO" : s_std_mode == STD_MODE_PAL ? "PAL" : "NTSC",
            s_detected_std_valid ? (s_detected_std == VIDEO_STD_PAL ? "PAL" : "NTSC") : "none",
-           s_signal_strength, s_menu_active, profile_name(profile_active()), transport_program_name(), transport_output_name(),
-           profile_live_mode(), menu_status_active(), firmware_id());
-}
-
-void control_flog_afc(int16_t *offset_khz, int16_t *residual_khz, uint32_t *corrections)
-{
-    *offset_khz = (int16_t)rf_offset_khz();
-    *residual_khz = (int16_t)s_afc_evidence.residual_khz;
-    *corrections = s_afc_corrections;
+           s_signal_strength, tx_hold_active(), profile_name(profile_active()), transport_program_name(), transport_output_name(),
+           profile_live_mode(), status_hold_active(), firmware_id());
 }
 
 /* End-to-end video quality of the last second (video_quality.h). */
@@ -834,8 +436,8 @@ void control_print(void)
            s_afc_sign_state == AFC2_SIGN_FLIPPED ? "flipped" : s_afc_sign_state == AFC2_SIGN_CONFIRMED ? "confirmed" :
            "unverified", s_std_mode == STD_MODE_AUTO ? "AUTO" : s_std_mode == STD_MODE_PAL ? "PAL" : "NTSC",
            s_detected_std_valid ? (s_detected_std == VIDEO_STD_PAL ? "PAL" : "NTSC") : "none",
-           s_signal_strength, s_menu_active, profile_deviation_x100(rf_channel_index()),
-           profile_name(profile_active()), transport_program_name(), menu_status_active());
+           s_signal_strength, tx_hold_active(), profile_deviation_x100(rf_channel_index()),
+           profile_name(profile_active()), transport_program_name(), status_hold_active());
     vq_t vq;
     control_video_quality(&vq);
     printf("VIDEO_Q known=%u snr_x10=%d lines_x100=%u lines=%lu windows=%lu periods=%lu (end-to-end: sync/porch "

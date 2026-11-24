@@ -17,16 +17,8 @@
  * GPIO27 is exclusively IQ-owned: do not drive it as a status LED. The LED/resistor remains connected; 40 MS/s capture and
  * sampling-phase margin on an unmodified XIAO still need board validation.
  * These are GPIO-matrix loopbacks; no external IQ wiring is required.
- * A hardware experiment build (-DC5VRX_HWX=<id>, hardware_experiments/<id>/
- * hwx.h) may replace the pads; production never includes hwx.h. */
-#ifdef C5VRX_HWX
-#include "hwx.h"
-#endif
-#ifdef HWX_IQ_GPIO_NUMS
-#define RF_IQ_GPIO_NUMS HWX_IQ_GPIO_NUMS
-#else
+ * (c5div-rx: the hardware-experiment pin maps of C5VRX-5 are not built.) */
 #define RF_IQ_GPIO_NUMS {1, 0, 25, 2, 27, 5, 3, 4}
-#endif
 
 esp_err_t rf_start(void);
 /* Stop the dump writer and Wi-Fi, request a USB download boot and restart,
@@ -71,14 +63,6 @@ enum { RF_LANE_COARSE, RF_LANE_FINE, RF_LANE_ULTRAFINE, RF_LANES };
 esp_err_t rf_set_lane(unsigned lane);
 unsigned rf_lane(void);
 void rf_reroute_lane(unsigned lane);   /* live, GPIO matrix only (STRONG LANE) */
-/* Hardware experiment HWX_MENU_ON_IQ (hwx.h): true puts PARLIO TX (the menu
- * raster) on the eight IQ pads instead of MODEM_DIAG, false routes MODEM_DIAG
- * back. Production: a no-op. */
-#ifdef HWX_MENU_ON_IQ
-void rf_hwx_pads_tx(bool tx);
-#else
-static inline void rf_hwx_pads_tx(bool tx) { (void)tx; }
-#endif
 const char *rf_lane_name(unsigned lane);
 
 typedef struct { const char *name; uint16_t freq_mhz; } fpv_channel_t;

@@ -45,16 +45,15 @@ void settings_save(void)
     (void)blob_store("settings", &s, sizeof(s));
 }
 
+/* c5div-rx: raceband only (R1 when nothing valid is stored). The OUTPUT
+ * level and video-standard choices of C5VRX-5 are not restored: without a
+ * menu nothing could change them back, so every boot uses 1.0x and AUTO. */
 void settings_load(void)
 {
-    /* Independent key preserves the existing channel/standard blob format. */
-    uint8_t output;
-    if (blob_load("output", &output, sizeof(output)) && output < OUTPUT_LEVELS)
-        (void)transport_set_output(output);
     settings_t s;
-    if (!blob_load("settings", &s, sizeof(s)) || s.version != SETTINGS_VERSION) return;
-    if (s.channel < FPV_CHANNELS) (void)rf_set_channel(s.channel);
-    if (s.std_mode <= STD_MODE_PAL) s_std_mode = (std_mode_t)s.std_mode;
+    size_t ch = 0;
+    if (blob_load("settings", &s, sizeof(s)) && s.version == SETTINGS_VERSION && s.channel < 8u) ch = s.channel;
+    (void)rf_set_channel(FPV_BAND_R * 8u + ch);
 }
 
 bool settings_prefs_load(settings_prefs_t *p)

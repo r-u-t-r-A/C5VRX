@@ -377,7 +377,7 @@ static uint32_t s_cn_windows;
 
 bool receiver_active(void)
 {
-    return !s_paused && (!s_menu_active || menu_splash_active()) && !phy_busy();
+    return !s_paused && (!tx_hold_active() || boot_window_active()) && !phy_busy();
 }
 
 bool receiver_paused(void) { return s_paused; }
@@ -402,7 +402,6 @@ bool receiver_pause(const char *tag)
     s_pause_us = esp_timer_get_time();
     /* A pause with video in the last 3 s interrupts a picture in use. */
     if (s_last_video_us && s_pause_us - s_last_video_us < 3000000) ++s_pauses_video;
-    rf_hwx_pads_tx(false);           /* hardware experiment: IQ back on the pads; the wait refills the ring */
     s_paused = true;
     vTaskDelay(pdMS_TO_TICKS(20));   /* let an in-flight window finish */
     strong_release();                /* the owner measures on the ultrafine lane */
@@ -423,7 +422,6 @@ void receiver_resume(void)
         if (ms >= s_pause_max_ms) { s_pause_max_ms = ms; memcpy(s_pause_longest, d + 4, 8); s_pause_longest[8] = 0; }
     }
     s_paused = false;
-    rf_hwx_pads_tx(s_menu_active && !menu_splash_active());   /* hardware experiment: menu back on the pads */
 }
 
 void receiver_pause_print(void)

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """C5VRX by Twotoz/contributors: exercise actual settings.c across reboot.
+c5div-rx: assertions adapted to raceband-only settings (see settings.c).
 
 Only NVS and receiver hardware boundaries are stubbed; persistence decisions
 are compiled from the production source. No ESP-IDF SDK emulation required.
@@ -50,6 +51,7 @@ RF = r'''
 #pragma once
 #include <stdbool.h>
 #define FPV_CHANNELS 48
+#define FPV_BAND_R 0
 unsigned rf_channel_index(void);
 bool rf_set_channel(unsigned);
 '''
@@ -103,70 +105,52 @@ unsigned rf_channel_index(void) { return channel; }
 bool rf_set_channel(unsigned c) { channel = c; return true; }
 bool transport_set_output(unsigned o) { assert(o < OUTPUT_LEVELS); output = o; ++output_applied; return true; }
 void receiver_set_gain_mode(uint8_t mode, bool save) { assert(!save); gain_mode = mode; ++gain_restores; }
-static void boot(void) { output = 0; channel = 0; s_std_mode = STD_MODE_AUTO; output_applied = 0;
+static void boot(void) { output = 0; channel = 99; s_std_mode = STD_MODE_AUTO; output_applied = 0;
     gain_mode = 0; gain_restores = 0; settings_load(); }
 static void seed(unsigned slot, const unsigned char *bytes, size_t n) {
     assert(n <= sizeof(slots[slot].bytes)); slots[slot].n = n; memcpy(slots[slot].bytes, bytes, n);
 }
 int main(void) {
-    boot(); assert(output == 0 && output_applied == 0 && channel == 0 && s_std_mode == STD_MODE_AUTO);
+    /* c5div-rx: empty NVS boots on R1 (raceband index 0). */
+    boot(); assert(channel == 0 && output_applied == 0 && s_std_mode == STD_MODE_AUTO);
+    /* A saved raceband channel comes back; the saved standard does not. */
+    const unsigned char r6[] = {1, 5, STD_MODE_PAL, 0};
+    seed(0, r6, sizeof(r6)); boot(); assert(channel == 5 && s_std_mode == STD_MODE_AUTO);
+    /* Any other band left by C5VRX-5 (here index 17, B2) falls back to R1. */
+    const unsigned char b2[] = {1, 17, STD_MODE_NTSC, 0};
+    seed(0, b2, sizeof(b2)); boot(); assert(channel == 0 && s_std_mode == STD_MODE_AUTO);
+    const unsigned char invalid[] = {1, FPV_CHANNELS, 255, 0};
+    seed(0, invalid, sizeof(invalid)); boot(); assert(channel == 0);
+    const unsigned char unknown_version[] = {2, 3, 0, 0};
+    seed(0, unknown_version, sizeof(unknown_version)); boot(); assert(channel == 0);
+    /* Saving: one write per change, none for an unchanged channel (wear). */
+    slots[0].n = 0; channel = 3; writes = commits = 0; settings_save(); assert(writes == 1 && commits == 1);
+    settings_save(); assert(writes == 1); boot(); assert(channel == 3);
+    /* A stored OUTPUT level (C5VRX-5 menu) is never applied at boot. */
     for (unsigned level = 0; level < OUTPUT_LEVELS; ++level) {
-        slots[1].n = 0; writes = commits = 0;
-        settings_save_output(level); assert(writes == 1 && commits == 1);
-        boot(); assert(output == level && output_applied == 1);
-        settings_save_output(level); assert(writes == 1 && commits == 1);
+        const unsigned char b = (unsigned char)level; seed(1, &b, 1);
+        boot(); assert(output == 0 && output_applied == 0 && channel == 3);
     }
-    const unsigned char legacy[] = {1, 17, STD_MODE_PAL, 0x5a};
-    seed(0, legacy, sizeof(legacy)); slots[1].n = 0;
-    boot(); assert(channel == 17 && s_std_mode == STD_MODE_PAL && output == 0);
-    settings_save_output(3); boot();
-    assert(channel == 17 && s_std_mode == STD_MODE_PAL && output == 3);
-    assert(slots[0].n == sizeof(legacy) && !memcmp(slots[0].bytes, legacy, sizeof(legacy)));
-    writes = commits = 0; settings_save(); assert(!writes && !commits);
-    channel = 24; s_std_mode = STD_MODE_NTSC; settings_save();
-    assert(writes == 1 && commits == 1); boot();
-    assert(channel == 24 && s_std_mode == STD_MODE_NTSC && output == 3);
-    for (unsigned bad = OUTPUT_LEVELS; bad < 256; ++bad) {
-        const unsigned char b = (unsigned char)bad; seed(1, &b, 1);
-        boot(); assert(output == 0 && output_applied == 0 && channel == 24);
-    }
-    const unsigned char too_long[] = {2, 0}; seed(1, too_long, 2);
-    boot(); assert(output == 0 && output_applied == 0);
-    const unsigned char valid_output = 2; seed(1, &valid_output, 1);
-    const unsigned char unknown_settings[] = {2, 17, STD_MODE_PAL, 0};
-    seed(0, unknown_settings, 4); boot();
-    assert(output == 2 && channel == 0 && s_std_mode == STD_MODE_AUTO);
-    slots[0].n = 0; boot(); assert(output == 2 && output_applied == 1);
-    const unsigned char invalid_settings[] = {1, FPV_CHANNELS, 255, 0};
-    seed(0, invalid_settings, 4); boot();
-    assert(output == 2 && channel == 0 && s_std_mode == STD_MODE_AUTO);
-    writes = commits = 0; settings_save_output(OUTPUT_LEVELS); settings_save_output(1000);
-    assert(!writes && !commits); boot(); assert(output == 2);
-    fail_open = 1; boot(); assert(output == 0 && !output_applied); settings_save_output(1);
-    fail_open = 0; boot(); assert(output == 2);
-    writes = commits = 0; fail_set = 1; settings_save_output(1);
-    assert(writes == 1 && !commits); fail_set = 0; boot(); assert(output == 2);
-    fail_commit = 1; settings_save_output(1); fail_commit = 0; boot(); assert(output == 2);
-    settings_save_output(1); boot(); assert(output == 1);
-    /* The legacy "gain_mode" key is never restored (a fixed mode left in NVS
-     * by an earlier firmware); the gain model comes from the prefs only. */
-    boot(); assert(!gain_restores);
-    const unsigned char old_fixed = 42; seed(2, &old_fixed, 1); boot(); assert(!gain_restores && gain_mode == 0);
-    /* A "flywheel" key left by an earlier firmware is ignored (flywheel removed). */
+    /* settings_save_output still persists verified levels without rewrites. */
+    slots[1].n = 0; writes = commits = 0; settings_save_output(2); assert(writes == 1 && commits == 1);
+    settings_save_output(2); assert(writes == 1);
+    settings_save_output(OUTPUT_LEVELS); settings_save_output(1000); assert(writes == 1);
+    /* NVS failures never stop the boot on a valid channel. */
+    fail_open = 1; boot(); assert(channel == 0); fail_open = 0; boot(); assert(channel == 3);
+    channel = 4; writes = commits = 0; fail_set = 1; settings_save(); assert(writes == 1 && !commits);
+    fail_set = 0; boot(); assert(channel == 3);
+    channel = 4; fail_commit = 1; settings_save(); fail_commit = 0; boot(); assert(channel == 3);
+    /* Legacy "gain_mode"/"flywheel" keys are never read or rewritten. */
+    const unsigned char old_fixed = 42; seed(2, &old_fixed, 1);
     const unsigned char old_flywheel = 1; seed(3, &old_flywheel, 1);
-    writes = commits = 0; boot(); assert(!writes && !commits && output == 1 && gain_mode == 0);
-    /* Menu prefs (FILTER, GAIN model, PHY FILT): saved once, read back after
-     * a reboot, unchanged values not rewritten, another version ignored. */
+    writes = commits = 0; boot(); assert(!writes && !commits && !gain_restores && gain_mode == 0);
+    /* prefs blob helpers (unused by c5div-rx, kept compiling): round trip. */
     settings_prefs_t p = {SETTINGS_PREFS_VERSION, 1, 254, 0}, q;
     assert(!settings_prefs_load(&q));
     writes = commits = 0; settings_prefs_store(&p); assert(writes == 1 && commits == 1);
-    boot(); assert(settings_prefs_load(&q) && !memcmp(&p, &q, sizeof(p)));
+    assert(settings_prefs_load(&q) && !memcmp(&p, &q, sizeof(p)));
     settings_prefs_store(&p); assert(writes == 1);
-    p.dfilt_mode = 8; settings_prefs_store(&p); assert(writes == 2);
-    assert(settings_prefs_load(&q) && q.dfilt_mode == 8 && q.filter_select == 1 && q.gain_mode == 254);
-    const unsigned char future[] = {2, 1, 0, 12}; seed(4, future, sizeof(future));
-    assert(!settings_prefs_load(&q));
-    puts("PASS: actual settings.c output save/reboot, legacy compatibility, invalid data, wear and NVS failures");
+    puts("PASS: actual settings.c (c5div-rx): raceband restore, R1 fallback, no OUTPUT/standard restore, wear and NVS failures");
     return 0;
 }
 '''
