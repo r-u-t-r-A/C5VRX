@@ -19,14 +19,16 @@
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "link.h"
 #include "phase8_gain_lut.h"
 #include "phy.h"
 #include "snapshot.h"
 #include "rf.h"
 
 #define BOOT_BUTTON      GPIO_NUM_28    /* XIAO ESP32-C5 BOOT */
-/* c5div-rx: external button to GND on XIAO D10 (free: no clock export). One
- * button wired to D10 of both receivers of a diversity pair drives both. */
+/* c5div-rx: external button to GND on XIAO D10 (free: no clock export), on
+ * the master or a single receiver. On the slave of a pair D10 receives the
+ * channel messages instead (link.c). */
 #define EXT_BUTTON       GPIO_NUM_10
 #define TICK_MS          50
 #define HOLD_R1_TICKS    40             /* 2 s: back to R1 */
@@ -186,16 +188,24 @@ static void control_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(TICK_MS));
 
-        /* c5div-rx: the BOOT button is the only control.
+        /* c5div-rx: the button is the only control.
          *   press           next raceband channel (R1..R8, then R1)
-         *   hold 2 s        back to R1: with one button wired to both
-         *                   receivers of a diversity pair this re-aligns them
+         *   hold 2 s        back to R1
          *   hold 8 s        one-time filter calibration, video stops ~30 s
          *                   (C5VRX-5 menu CALIBRATE > QUICK / console F)
-         * BOOT and D10 (external, to GND) act the same. Calibration and the
-         * boot window own TX: no button, no AFC. */
+         * BOOT and D10 (external, to GND) act the same. On the slave of a
+         * pair D10 is the channel link and BOOT only calibrates, as long as
+         * the master is heard. Calibration and the boot window own TX: no
+         * button, no AFC; the link keeps running. */
+        link_poll();
         if (status_hold_active() || boot_window_active()) { btn = 0; continue; }
-        const bool b_boot = button_input(0, BOOT_BUTTON), b_ext = button_input(1, EXT_BUTTON);
+        const int wanted = link_take_channel();
+        if (wanted >= 0 && (size_t)wanted != rf_channel_index()) {
+            printf("[LINK] master is on R%d\n", wanted + 1);
+            if (rf_set_channel((size_t)wanted) == ESP_OK) after_retune();
+        }
+        const bool follow = link_alive();
+        const bool b_boot = button_input(0, BOOT_BUTTON), b_ext = !link_is_slave() && button_input(1, EXT_BUTTON);
         if (boot_grace) { --boot_grace; btn = 0; }
         else if (b_boot || b_ext) {
             ++btn;
@@ -205,14 +215,14 @@ static void control_task(void *arg)
                 printf("[BUTTON] %s held 15 s: ignored until released\n", b_ext ? "D10" : "BOOT");
                 btn = 0;
             } else if (btn == HOLD_R1_TICKS) {
-                printf("[BUTTON] hold: R1\n");
-                if (rf_channel_index() != 0 && rf_set_channel(0) == ESP_OK) after_retune();
+                if (!follow) printf("[BUTTON] hold: R1\n");
+                if (!follow && rf_channel_index() != 0 && rf_set_channel(0) == ESP_OK) after_retune();
             } else if (btn == HOLD_CAL_TICKS) {
                 printf("[BUTTON] long hold: filter calibration\n");
                 filter_request();
             }
         } else if (btn) {
-            if (btn >= 2 && btn < HOLD_R1_TICKS) { rf_next_channel(); after_retune(); }
+            if (btn >= 2 && btn < HOLD_R1_TICKS && !follow) { rf_next_channel(); after_retune(); }
             btn = 0;
         }
 
@@ -368,6 +378,7 @@ void control_start(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
+    link_start();
     printf("BUTTON inputs at start: BOOT(GPIO28)=%d D10(GPIO10)=%d (1 = released)\n", gpio_get_level(BOOT_BUTTON),
            gpio_get_level(EXT_BUTTON));
     /* AFC is always on (C5VRX-5's saved "afc_off" menu choice is ignored);
@@ -395,13 +406,13 @@ void control_print_beat(void)
      * afc_locked alone said SEARCH over a good picture without a lock. */
     const int64_t video_at = s_last_video_us;
     printf("STATUS channel=%s freq=%u afc_locked=%u video=%u standard=%s detected=%s signal=%d hold=%u mode=%s demod=%s "
-           "output=%s live=%u busy=%u fw=%s\n",
+           "output=%s live=%u busy=%u link=%s fw=%s\n",
            rf_channel()->name, rf_frequency_mhz(), s_afc_locked,
            video_at && esp_timer_get_time() - video_at < 500000,
            s_std_mode == STD_MODE_AUTO ? "AUTO" : s_std_mode == STD_MODE_PAL ? "PAL" : "NTSC",
            s_detected_std_valid ? (s_detected_std == VIDEO_STD_PAL ? "PAL" : "NTSC") : "none",
            s_signal_strength, tx_hold_active(), profile_name(profile_active()), transport_program_name(), transport_output_name(),
-           profile_live_mode(), status_hold_active(), firmware_id());
+           profile_live_mode(), status_hold_active(), link_role(), firmware_id());
 }
 
 /* End-to-end video quality of the last second (video_quality.h). */

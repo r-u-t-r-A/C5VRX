@@ -33,6 +33,7 @@ The GPL-3.0 warranty disclaimer (sections 15–17 of `LICENSE`) applies.
 | | C5VRX-5 | c5div-rx |
 |---|---|---|
 | Controls | on-screen menu, USB console, web console | **one button**, nothing else |
+| Two receivers | – | **channel link**: the slave follows the master, the Pi can show the channel |
 | Channels | 6 bands × 8 (48) and a channel scanner | **raceband R1–R8** only |
 | DAC bit 2 | D6/GPIO11 (or D3 with *Clock Pin D10* ON) | **always D3/GPIO7**, no clock export |
 | Boot screen | logo + loading bar (menu raster) | flat blanking level for 3–4 s, same timing |
@@ -57,9 +58,31 @@ pull-up). Both act the same.
 
 The channel is saved and comes back after a power cycle.
 
-**Diversity pairs:** wire one button to D10 of *both* receivers (one wire to
-each D10, a common GND). Both see every press. If one ever misses a press,
-hold 2 s and both go back to R1 together.
+### Channel link (diversity pairs)
+
+One receiver, the **master**, has the button. It sends its channel as text on
+**D6**, three times on every change and then every 5 s. The **slave** listens
+on **D10** and follows. Nothing is acknowledged: a slave that missed a message
+or was restarted is right again within 5 s.
+
+```
+master D6  ──┬── slave D10
+             └── Pi GPIO15 / RXD (header pin 10), optional, for display
+common GND;  button: master D10 to GND only
+```
+
+- **The same firmware runs on both.** A receiver that gets a valid message on D10
+  is the slave until it is restarted: it sends nothing, ignores D10 as a button, and
+  its BOOT button only does the 8 s calibration. If the master is silent for 15 s,
+  BOOT works as a channel button again. Filter calibration is per chip: hold BOOT on
+  the slave.
+- **No button on the slave's D10.** Before this link existed one button went to both
+  D10 pins; remove that wire from the slave.
+- Message: `$C5,R3,5732*14` + CR LF, 9600 baud 8N1, 3.3 V, open drain with the chips'
+  pull-ups. `14` is the XOR of the characters between `$` and `*`. Checksum, channel
+  and frequency must all agree. D6 is also the boot ROM's log output, so some
+  other text appears on the line while the master starts.
+- The 2 s `STATUS` line on USB shows `link=master`, `slave` or `slave_silent`.
 
 | Channel | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 |
 |---|---|---|---|---|---|---|---|---|
@@ -73,8 +96,8 @@ way as in C5VRX-5 and is not characterised.
 | Pin | Use |
 |---|---|
 | D4, D5, **D3**, D7, D8, D9 | video bus bit 0 (LSB) … bit 5 (MSB). Sync tip = code 0, blanking = code 20 |
-| D10 | optional external button to GND |
-| D6 | unused (C5VRX-5 bit 2 without Clock Pin D10) |
+| D10 | master or single receiver: external button to GND. Slave: channel link in |
+| D6 | channel link out (C5VRX-5: bit 2 without Clock Pin D10) |
 | D0, D1, D2 | do not use: internal IQ routing (C5VRX-5) |
 
 The bus updates at 20 MS/s (C5VRX-5's TX40 cadence, each code held for two
