@@ -10,7 +10,7 @@ CC="cc -O2 -std=c11 -Wall -Wextra -Werror -I../main"
 run() { local t=$1; shift; echo "== $t"; "$T/$t" "$@" >/dev/null; }
 for t in test_quiet test_profile test_afc test_afc_measure test_control_window test_cn_observation \
          test_transport_recovery test_calibration_noise test_sphase test_dco_slots test_dc_servo \
-         test_flightlog test_link; do
+         test_flightlog test_link test_button; do
   $CC "$t.c" -lm -o "$T/$t"; run "$t"
 done
 $CC test_dc_trim.c -o "$T/test_dc_trim"; run test_dc_trim

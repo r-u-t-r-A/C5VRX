@@ -31,7 +31,7 @@ int main(void)
     run(1000);
     assert(!memcmp(stub_txbuf, "$C5,R4,", 7) && sent() == 3);
 
-    /* button bounce, boot log and broken messages do not make it a slave */
+    /* line noise, boot log and broken messages do not make it a slave */
     rx("\xff\x7f ESP-ROM:esp32c5\r\n$C5,R3,5732*15\r\n$C5,R9,5954*00\r\n");
     run(200);
     assert(!link_is_slave() && link_take_channel() < 0);
@@ -52,7 +52,7 @@ int main(void)
     run(14000);
     assert(sent() == 0 && link_alive());
     run(2000);
-    assert(sent() == 0 && !link_alive() && link_is_slave());  /* master gone: buttons work again, still silent */
+    assert(sent() == 0 && !link_alive() && link_is_slave());  /* master gone: BOOT changes channel again, still silent */
 
     /* several messages in one poll: the last one counts */
     for (unsigned ch = 0; ch < 3; ++ch) { link_format(want, sizeof(want), ch); rx(want); }

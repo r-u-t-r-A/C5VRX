@@ -5,10 +5,10 @@
  *                                  \--> Pi GPIO15 / RXD (pin 10)
  *
  * The same firmware runs on both. A receiver that gets a valid message on
- * D10 is the slave: it follows the messages, sends nothing and does not use
- * D10 as a button any more. A receiver that gets none is the master (or on
- * its own): D10 is its button. D0/D1/D2 carry IQ, and D6 is the ROM's boot
- * log output, hence the different pins for sending and receiving.
+ * D10 is the slave: it follows the messages and sends nothing. A receiver
+ * that gets none is the master (or on its own). D10 is never a button (the
+ * BOOT button is). D0/D1/D2 carry IQ, and D6 is the ROM's boot log output,
+ * hence the different pins for sending and receiving.
  *
  * Polled from the control task through the UART's FIFOs (128 bytes, 133 ms
  * at 9600 baud): no driver, no interrupt, no buffers. */
@@ -46,8 +46,7 @@ void link_start(void)
     esp_err_t err = uart_param_config(LINK_UART, &cfg);
     if (err == ESP_OK) err = uart_set_pin(LINK_UART, LINK_TX_GPIO, LINK_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err == ESP_OK) {
-        /* Open drain: two senders on one wire, or a button still connected to
-         * it, cannot fight. */
+        /* Open drain: two senders on one wire cannot fight. */
         gpio_od_enable(LINK_TX_GPIO);
         gpio_pullup_en(LINK_TX_GPIO);
         gpio_pullup_en(LINK_RX_GPIO);

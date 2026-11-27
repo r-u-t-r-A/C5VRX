@@ -19,39 +19,19 @@
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "button.h"
 #include "link.h"
 #include "phase8_gain_lut.h"
 #include "phy.h"
 #include "snapshot.h"
 #include "rf.h"
 
+/* c5div-rx: the XIAO BOOT button is the only button (debounce: button.h).
+ * D10 is not a button: it is the channel link input (link.c). An open or
+ * noisy D10 can read as presses and holds and jump the channel. */
 #define BOOT_BUTTON      GPIO_NUM_28    /* XIAO ESP32-C5 BOOT */
-/* c5div-rx: external button to GND on XIAO D10 (free: no clock export), on
- * the master or a single receiver. On the slave of a pair D10 receives the
- * channel messages instead (link.c). */
-#define EXT_BUTTON       GPIO_NUM_10
-#define TICK_MS          50
-#define HOLD_R1_TICKS    40             /* 2 s: back to R1 */
-#define HOLD_CAL_TICKS   160            /* 8 s: one-time filter calibration */
-#define ARM_TICKS        10             /* an input counts only after 0.5 s released */
-#define STUCK_TICKS      300            /* 15 s held: ignore that input until released */
-
-/* An input becomes a button only after it has been seen released (high)
- * for ARM_TICKS, and a hold of STUCK_TICKS disarms it until it is released
- * again. A D10 line that is shorted or pulled to ground can then never
- * start calibration after calibration (seen on the first board: an input
- * read low from boot, every ~13 s a "long hold" took the video for ~10 s). */
-static unsigned s_btn_high[2];
-static bool s_btn_armed[2];
-static bool button_input(int k, gpio_num_t pin)
-{
-    if (gpio_get_level(pin)) {
-        if (s_btn_high[k] < ARM_TICKS && ++s_btn_high[k] == ARM_TICKS) s_btn_armed[k] = true;
-        return false;
-    }
-    s_btn_high[k] = 0;
-    return s_btn_armed[k];
-}
+#define TICK_MS          50             /* = button.h sample period */
+static button_t s_button;
 #define RETUNE_SETTLE_TICKS 10          /* 500 ms after a PHY transaction */
 #define CONTROL_STACK_BYTES 6144u
 
@@ -182,48 +162,44 @@ static void control_task(void *arg)
     uint8_t seen_sign_state = afc.sign_state;
     bool own_write = false;
     uint8_t afc_lost = 0;
-    unsigned settle = RETUNE_SETTLE_TICKS, btn = 0, boot_grace = 20;
+    unsigned settle = RETUNE_SETTLE_TICKS, boot_grace = 20;
     bool was_locked = false;
     uint32_t seen_phy = phy_generation(), seen_control = s_control_epoch;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(TICK_MS));
 
-        /* c5div-rx: the button is the only control.
+        /* c5div-rx: the BOOT button is the only control.
          *   press           next raceband channel (R1..R8, then R1)
          *   hold 2 s        back to R1
          *   hold 8 s        one-time filter calibration, video stops ~30 s
          *                   (C5VRX-5 menu CALIBRATE > QUICK / console F)
-         * BOOT and D10 (external, to GND) act the same. On the slave of a
-         * pair D10 is the channel link and BOOT only calibrates, as long as
-         * the master is heard. Calibration and the boot window own TX: no
-         * button, no AFC; the link keeps running. */
+         * On the slave of a pair BOOT only calibrates, as long as the master
+         * is heard. Calibration and the boot window own TX: no button, no
+         * AFC; the link keeps running. */
+        const btn_event_t ev = button_step(&s_button, gpio_get_level(BOOT_BUTTON) == 0);
         link_poll();
-        if (status_hold_active() || boot_window_active()) { btn = 0; continue; }
+        if (status_hold_active() || boot_window_active()) { button_cancel(&s_button); continue; }
         const int wanted = link_take_channel();
         if (wanted >= 0 && (size_t)wanted != rf_channel_index()) {
             printf("[LINK] master is on R%d\n", wanted + 1);
             if (rf_set_channel((size_t)wanted) == ESP_OK) after_retune();
         }
         const bool follow = link_alive();
-        const bool b_boot = button_input(0, BOOT_BUTTON), b_ext = !link_is_slave() && button_input(1, EXT_BUTTON);
-        if (boot_grace) { --boot_grace; btn = 0; }
-        else if (b_boot || b_ext) {
-            ++btn;
-            if (btn == STUCK_TICKS) {
-                if (b_boot) s_btn_armed[0] = false;
-                if (b_ext) s_btn_armed[1] = false;
-                printf("[BUTTON] %s held 15 s: ignored until released\n", b_ext ? "D10" : "BOOT");
-                btn = 0;
-            } else if (btn == HOLD_R1_TICKS) {
-                if (!follow) printf("[BUTTON] hold: R1\n");
-                if (!follow && rf_channel_index() != 0 && rf_set_channel(0) == ESP_OK) after_retune();
-            } else if (btn == HOLD_CAL_TICKS) {
-                printf("[BUTTON] long hold: filter calibration\n");
-                filter_request();
-            }
-        } else if (btn) {
-            if (btn >= 2 && btn < HOLD_R1_TICKS && !follow) { rf_next_channel(); after_retune(); }
-            btn = 0;
+        if (boot_grace) { --boot_grace; button_cancel(&s_button); }
+        else if ((ev == BTN_PRESS || ev == BTN_HOLD_R1) && follow) {
+            printf("[BUTTON] slave: the channel follows the master\n");
+        } else if (ev == BTN_PRESS) {
+            rf_next_channel();
+            printf("[BUTTON] press: %s\n", rf_channel()->name);
+            after_retune();
+        } else if (ev == BTN_HOLD_R1) {
+            printf("[BUTTON] hold: R1\n");
+            if (rf_channel_index() != 0 && rf_set_channel(0) == ESP_OK) after_retune();
+        } else if (ev == BTN_HOLD_CAL) {
+            printf("[BUTTON] long hold: filter calibration\n");
+            filter_request();
+        } else if (ev == BTN_STUCK) {
+            printf("[BUTTON] BOOT held 15 s: ignored until released\n");
         }
 
         transport_poll_faults();
@@ -372,15 +348,14 @@ static void control_task(void *arg)
 void control_start(void)
 {
     const gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << BOOT_BUTTON) | (1ULL << EXT_BUTTON),
+        .pin_bit_mask = 1ULL << BOOT_BUTTON,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
     link_start();
-    printf("BUTTON inputs at start: BOOT(GPIO28)=%d D10(GPIO10)=%d (1 = released)\n", gpio_get_level(BOOT_BUTTON),
-           gpio_get_level(EXT_BUTTON));
+    printf("BUTTON at start: BOOT(GPIO28)=%d (1 = released)\n", gpio_get_level(BOOT_BUTTON));
     /* AFC is always on (C5VRX-5's saved "afc_off" menu choice is ignored);
      * the live profile switch stays in its C5VRX-5 default (report only). */
     profile_set_live_mode(false);
